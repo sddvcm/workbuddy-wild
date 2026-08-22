@@ -13,6 +13,25 @@
 > 
 > 开发者/高级配置见 [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md)。
 
+## 更新记录
+
+### v0.3.1（2026-08-22）
+- 深色/浅色**手动切换**：面板右上角新增 🌙/☀ 按钮，点击即切换并记忆偏好；未手动设置时跟随系统深浅色
+- 「关于软件」信息更新
+
+### v0.3.0（2026-08-22）
+- **深色模式**：面板跟随系统深色（浅色卡片整体换暗色）
+- **日志自动轮转**：`data/app.log` 超过 5MB 自动转存为 `app.log.1`，不再无限增长
+- **账号凭证加密**：auth 文件中的 token 用 Windows DPAPI 加密落盘，仅本机当前用户可解密；旧明文文件自动兼容
+- **API-Key 安全提示**：默认 API-Key（`WorkBuddy2API`）且监听对外（`0.0.0.0`）时，启动弹窗提醒修改，避免局域网裸奔
+- **版本号统一**：构建时 `-ldflags` 注入，面板/文件版本一处维护
+
+### v0.2.x 稳定性修复（本 fork）
+- **托盘卡死根治**：移除原生右键菜单（`TrackPopupMenu` 模态循环卡死托盘消息循环的根因），右键改为与左键一致直接弹面板
+- **关闭带确认**：面板右上角 ✕ 与底部「退出」均弹确认框，防误关
+- **面板拖动 + 位置记忆**：可拖动面板到任意位置，重启后保留
+- **进程级单实例锁 / 退出超时强杀 / WebView2 GPU 禁用**：多开、退不出、WebView2 卡死等问题的兜底修复
+
 ## 它解决什么问题
 
 - WorkBuddy/CodeBuddy 和 TraeWork 账号的对话额度有限，多个账号可以共享/轮流使用
@@ -22,7 +41,7 @@
 
 ## 快速开始（普通用户）
 
-1. **下载**：从 [Releases](https://github.com/rockswang/workbuddy-wild/releases) 下载最新版 `workbuddy-wild-windows-amd64.zip`，解压后双击 `workbuddy-wild.exe`
+1. **下载**：从 [Releases](https://github.com/sddvcm/workbuddy-wild/releases) 下载最新版 `workbuddy-wild-windows-amd64.zip`，解压后双击 `workbuddy-wild.exe`
 2. 稍等片刻会弹出提示框，显示 **OpenAI 兼容 API 地址**（默认 `http://127.0.0.1:7863`）——记住它，关掉即可
 3. 右下角出现绿色 W 托盘图标，**单击 / 双击 / 右击** 都能打开管理面板
 4. **添加账号**：面板点"＋ 添加账号"→ 选择 WorkBuddy 或 TraeWork → 自动打开无痕浏览器 → 登录对应平台 → 自动写入凭证并立即签到
