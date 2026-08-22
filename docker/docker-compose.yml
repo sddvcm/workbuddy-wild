@@ -1,0 +1,38 @@
+# 飞牛 NAS (fnOS) Docker Compose 部署文件
+# 用法：把整个 docker/ 目录传到 NAS，cd 进去后执行：
+#   docker compose up -d --build
+#
+# 设计要点（根治旧版部署失败）：
+#   1. 镜像只 COPY 预编译的静态二进制，容器内不编译、不拉 Go 模块 → 不受 GOPROXY 超时影响。
+#   2. entrypoint 用 WB2A_* 环境变量在容器内生成 /app/config.json，二进制读取它；
+#      config.json 永不 bind 挂载，不会因“单文件挂载成目录”而崩溃。
+#   3. 只挂载目录 ./data:/data（账号 + 状态），数据持久化、可升级。
+#   4. healthcheck 探 /healthz，restart: unless-stopped 自动拉起。
+
+services:
+  workbuddy-wild:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: workbuddy-wild:latest
+    container_name: workbuddy-wild
+    restart: unless-stopped
+    environment:
+      # 监听全部网卡（容器内需 0.0.0.0，不能用 127.0.0.1）
+      WB2A_LISTEN: ":7863"
+      # ⚠️ 务必改成强随机值！这是 OpenAI 兼容接口的 Bearer 鉴权密钥
+      WB2A_API_KEY: "CHANGE_ME_strong_api_key"
+      WB2A_AUTH_DIR: "/data/auths"
+      WB2A_STATE_FILE: "/data/state.json"
+      WB2A_REGION: "cn"
+      TZ: "Asia/Shanghai"
+    ports:
+      - "7863:7863"
+    volumes:
+      - ./data:/data
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "-", "http://127.0.0.1:7863/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s

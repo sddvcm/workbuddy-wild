@@ -1,0 +1,16 @@
+{
+  "auth": {
+    "accessToken": "在此粘贴你的 accessToken（明文，NAS/Linux 无法解密 Windows DPAPI）",
+    "refreshToken": "在此粘贴你的 refreshToken",
+    "expiresAt": 1753600000,
+    "domain": "",
+    "apiHost": "",
+    "machineId": "",
+    "deviceId": ""
+  },
+  "account": {
+    "uid": "你的uid（文件名需为 workbuddy-<uid>.json）",
+    "enterpriseId": "",
+    "nickname": "备注名"
+  }
+}
