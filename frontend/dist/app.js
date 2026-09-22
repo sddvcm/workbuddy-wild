@@ -8,6 +8,7 @@ const rt = window.runtime;
 let state = null;
 let loginTimer = null;
 let loginURL = "";
+let liveTimer = null;
 
 const $ = (id) => document.getElementById(id);
 
@@ -46,10 +47,28 @@ function render() {
   $("acctEmpty").classList.toggle("hidden", state.accounts.length > 0);
   $("inPort").value = state.listen_port;
   $("chkAutostart").checked = state.autostart;
+  $("selStrategy").value = state.strategy || "credits";
+  renderStrategyDesc();
   renderKey();
   renderHostSelect();
   renderAccounts();
   renderHours();
+}
+
+const STRATEGY_DESC = {
+  credits: "使用剩余积分最多的账号，尽量摊薄消耗。",
+  expire: "优先消耗最快过期的凭证，减少 token 到期的浪费。",
+  roundrobin: "按顺序轮流使用每个账号，调用次数均衡分配。",
+};
+
+function renderStrategyDesc() {
+  const s = $("selStrategy").value;
+  $("strategyDesc").textContent = STRATEGY_DESC[s] || "";
+  $("strategyHint").textContent = "策略：" + strategyLabel(s);
+}
+
+function strategyLabel(s) {
+  return { credits: "优先积分", expire: "优先过期", roundrobin: "负载均衡" }[s] || "优先积分";
 }
 
 function renderKey() {
@@ -95,17 +114,28 @@ function renderHostSelect() {
 function renderAccounts() {
   const box = $("acctList");
   if (!state || !state.accounts) return;
-  box.innerHTML = state.accounts.map((a) => {
+  // 排序：正在调用 > 最近用过 > 其余（按积分降序），让活跃账号浮到顶部。
+  const accts = state.accounts.slice().sort((a, b) => {
+    if (a.in_use !== b.in_use) return a.in_use ? -1 : 1;
+    const au = a.last_used_at ? 1 : 0, bu = b.last_used_at ? 1 : 0;
+    if (au !== bu) return bu - au;
+    return (b.credits || 0) - (a.credits || 0);
+  });
+  box.innerHTML = accts.map((a) => {
     const name = a.nickname || a.uid;
     const credits = a.credits ? Number(a.credits).toLocaleString() : "0";
     const status = accountStatus(a);
     const group = a.group || "workbuddy";
     const icon = group === "traework" ? "T" : "W";
     const iconCls = group === "traework" ? "icon-trae" : "icon-wb";
-    return `<div class="acct">
+    const live = a.in_use
+      ? `<span class="live-badge"><span class="dot"></span>调用中</span>`
+      : (a.last_used_at ? `<span class="used-badge" title="最近调用 ${esc(a.last_used_at)}">最近用过</span>` : "");
+    return `<div class="acct${a.in_use ? " in-use" : ""}">
       <div class="acct-row1">
         <span class="acct-icon ${iconCls}" title="${group === "traework" ? "TraeWork" : "WorkBuddy"}">${icon}</span>
         <span class="acct-name" title="${esc(name)}">${esc(name)}</span>
+        ${live}
         <span class="acct-credits">${credits}</span>
       </div>
       <div class="acct-row2">
@@ -116,16 +146,6 @@ function renderAccounts() {
       </div>
     </div>`;
   }).join("");
-  // 列表高度自适应：账号数 1-4 逐行增高（每行约 55px），超过 4 个固定 4 行高度并出滚动条；
-  // 0 个账号时列表为空（显示空提示），高度设为 0。
-  const n = state.accounts.length;
-  if (n <= 0) {
-    box.style.maxHeight = "0px";
-  } else if (n <= 4) {
-    box.style.maxHeight = (n * 55 + (n - 1) * 5) + "px";
-  } else {
-    box.style.maxHeight = (4 * 55 + 3 * 5) + "px";
-  }
 }
 
 function accountStatus(a) {
@@ -134,12 +154,13 @@ function accountStatus(a) {
     const until = a.until ? ` 至 ${a.until}` : "";
     return { cls: "warn", txt: `冷却中（${a.reason || "余额不足"}${until}）` };
   }
+  const used = a.last_used_at ? ` · 调用 ${a.last_used_at}` : "";
   if (a.last_checkin_at) {
     const icon = a.last_checkin_ok ? "✓" : "✗";
     const cls = a.last_checkin_ok ? "ok" : "err";
-    return { cls, txt: `${icon} ${a.last_checkin_at} 签到：${a.last_checkin_msg || (a.last_checkin_ok ? "成功" : "失败")}` };
+    return { cls, txt: `${icon} 签到 ${a.last_checkin_at}${used}` };
   }
-  return { cls: "", txt: "尚未签到" };
+  return { cls: "", txt: "尚未签到" + used };
 }
 
 function renderHours() {
@@ -279,7 +300,7 @@ async function copyLoginURL() {
 // ---------------------------------------------------------------------------
 
 function bind() {
-  $("btnHide").onclick = () => Go.HidePanel();
+  $("btnMin").onclick = () => Go.HidePanel();
   // 右上角关闭 + 底部退出：都先询问（关闭后自动签到停止）
   const confirmQuit = () => askConfirm("关闭程序", "确定关闭 WorkBuddy-Wild？\n关闭后自动签到将停止。", () => Go.QuitAll());
   $("btnClose").onclick = confirmQuit;
@@ -310,8 +331,22 @@ function bind() {
     rt.BrowserOpenURL("https://github.com/sddvcm/workbuddy-wild");
   };
 
-  // 深色/浅色手动切换（localStorage 记忆；未设置时跟随系统）
+  // 深色/浅色手动切换（localStorage 记忆；默认浅色，不跟随系统）
   $("btnTheme").onclick = toggleTheme;
+
+  // 积分策略：选择即生效（后端写入 config.json）
+  $("selStrategy").onchange = async () => {
+    const val = $("selStrategy").value;
+    try {
+      await Go.SetStrategy(val);
+      state.strategy = val;
+      renderStrategyDesc();
+      toast("积分策略已切换：" + strategyLabel(val));
+    } catch (e) {
+      toast("切换失败：" + e);
+      $("selStrategy").value = state.strategy || "credits";
+    }
+  };
 
   // API-Key：点击明文值进入编辑，blur/Enter 即生效，Esc 取消
   $("keyVal").onclick = editKey;
@@ -411,14 +446,14 @@ function bind() {
   btnConfirmCancel.onclick = closeConfirm;
 
   // 失焦自动隐藏已由后端 focus watchdog 处理（点击窗口外退出面板进程）
-  let lastShownAt = 0;
   const onShown = () => {
-    lastShownAt = Date.now();
     // 重触发内容上浮动效
     const el = $("app");
     el.classList.remove("pop");
     void el.offsetWidth;
     el.classList.add("pop");
+    // 面板打开时立刻拉一次账号状态，避免显示过期数据
+    load();
   };
   rt.EventsOn("panel:shown", onShown);
   document.addEventListener("keydown", (e) => {
@@ -462,15 +497,43 @@ function bind() {
   });
 }
 
+// 面板可见时轮询账号状态：让「正在调用」标识能实时出现/消失。
+// 面板隐藏后停止轮询，避免无谓开销。
+function startLivePolling() {
+  if (liveTimer) return;
+  liveTimer = setInterval(async () => {
+    if (document.hidden) return;
+    try {
+      const accts = await Go.GetAccounts();
+      if (state && accts) {
+        state.accounts = accts;
+        renderAccounts();
+      }
+    } catch (e) { /* 忽略瞬时失败 */ }
+  }, 1500);
+}
+
+function stopLivePolling() {
+  clearInterval(liveTimer);
+  liveTimer = null;
+}
+
 document.addEventListener("DOMContentLoaded", () => {
-  applyTheme(localStorage.getItem("wbw_theme") || "");
+  // 默认浅色：只在用户显式选过深色时才用深色（不再跟随系统，避免系统深色导致看不清）
+  applyTheme(localStorage.getItem("wbw_theme") || "light");
   bind();
   load();
+  startLivePolling();
+});
+
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden) stopLivePolling();
+  else startLivePolling();
 });
 
 // ---------------------------------------------------------------------------
 // 深色/浅色手动切换
-// data-theme="dark"/"light"：手动强制；未设置：跟随系统（CSS @media 兜底）
+// data-theme="dark"/"light"：手动强制；默认 light
 // ---------------------------------------------------------------------------
 function applyTheme(theme) {
   const root = document.documentElement;
@@ -479,25 +542,16 @@ function applyTheme(theme) {
     root.setAttribute("data-theme", "dark");
     btn.textContent = "☀";
     btn.title = "切换到浅色";
-  } else if (theme === "light") {
+  } else {
     root.setAttribute("data-theme", "light");
     btn.textContent = "🌙";
     btn.title = "切换到深色";
-  } else {
-    root.removeAttribute("data-theme");
-    const sysDark = matchMedia("(prefers-color-scheme: dark)").matches;
-    btn.textContent = sysDark ? "☀" : "🌙";
-    btn.title = "手动切换深色/浅色";
   }
 }
 
 function toggleTheme() {
   const cur = document.documentElement.getAttribute("data-theme");
-  const sysDark = matchMedia("(prefers-color-scheme: dark)").matches;
-  let next;
-  if (cur === "dark") next = "light";
-  else if (cur === "light") next = "dark";
-  else next = sysDark ? "light" : "dark"; // 当前跟随系统 → 切到相反
+  const next = cur === "dark" ? "light" : "dark";
   localStorage.setItem("wbw_theme", next);
   applyTheme(next);
 }

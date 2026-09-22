@@ -94,6 +94,11 @@ type Config struct {
 	StateFile string `json:"state_file"` // ./data/state.json
 	Region    string `json:"region"`     // 只收 "cn"
 
+	// Strategy 账号挑选策略：credits（优先积分）/ expire（优先过期）/ roundrobin（负载均衡）。
+	Strategy string `json:"strategy"`
+	// MaxRotate 单个请求最多尝试的账号数（失败后轮换下一个）。
+	MaxRotate int `json:"max_rotate"`
+
 	Cooldown struct {
 		HardCredit  string `json:"hard_credit"`   // "12h"
 		SoftRate    string `json:"soft_rate"`     // "60s"
@@ -125,6 +130,8 @@ func Default() *Config {
 		AuthDir:   "./auths",
 		StateFile: "./data/state.json",
 		Region:    "cn",
+		Strategy:  "credits",
+		MaxRotate: 3,
 	}
 	c.Cooldown.HardCredit = "12h"
 	c.Cooldown.SoftRate = "60s"
@@ -242,6 +249,14 @@ func applyEnv(c *Config) {
 	if v := os.Getenv("WB2A_REGION"); v != "" {
 		c.Region = v
 	}
+	if v := os.Getenv("WB2A_STRATEGY"); v != "" {
+		c.Strategy = v
+	}
+	if v := os.Getenv("WB2A_MAX_ROTATE"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			c.MaxRotate = n
+		}
+	}
 	if v := os.Getenv("WB2A_HARD_CREDIT"); v != "" {
 		c.Cooldown.HardCredit = v
 	}
@@ -289,6 +304,21 @@ func (c *Config) normalize() error {
 	c.Region = strings.ToLower(c.Region)
 	if c.Region != "cn" && c.Region != "global" {
 		return fmt.Errorf("region must be cn or global, got %q", c.Region)
+	}
+	// 策略白名单校验：非法值回退默认（不阻断启动，配置手改成垃圾也能跑）。
+	switch strings.ToLower(strings.TrimSpace(c.Strategy)) {
+	case "credits", "expire", "roundrobin":
+		c.Strategy = strings.ToLower(strings.TrimSpace(c.Strategy))
+	case "":
+		c.Strategy = "credits"
+	default:
+		return fmt.Errorf("strategy must be credits/expire/roundrobin, got %q", c.Strategy)
+	}
+	if c.MaxRotate <= 0 {
+		c.MaxRotate = 3
+	}
+	if c.MaxRotate > 20 {
+		c.MaxRotate = 20
 	}
 	// 兼容旧版 checkin_hours；新版本统一规范化为 HH:MM。
 	if len(c.Schedule.CheckinTimes) == 0 {

@@ -73,9 +73,28 @@ func TestPickExcluding(t *testing.T) {
 	if got == nil || got.UID != "u2" {
 		t.Fatalf("pick=%+v want u2", got)
 	}
+	// 全部账号都试过后，允许回退到起点（返回非 nil），
+	// 这样 handler 的 MaxRotate 循环不会因为"无候选"提前 break，
+	// 与回退行为配套的失败计数在 handler 层做。
 	tried["u2"] = true
+	if got := p.PickExcluding(tried); got == nil {
+		t.Fatal("全部试完应回退到可用账号而非 nil")
+	}
+}
+
+// 无任何可用账号（全部冷却/禁用）时必须返回 nil。
+func TestPickExcludingNilWhenAllUnavailable(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	p.Add(&auth.Auth{UID: "u2"})
+	p.Disable("u1", "session dead")
+	p.Cooldown("u2", CoolHard, time.Hour, "余额不足")
+	if got := p.PickExcluding(nil); got != nil {
+		t.Fatalf("全部不可用时应返回 nil，实际 %+v", got)
+	}
+	tried := map[string]bool{"u1": true, "u2": true}
 	if got := p.PickExcluding(tried); got != nil {
-		t.Fatalf("want nil, got %+v", got)
+		t.Fatalf("全部不可用且都试过时应返回 nil，实际 %+v", got)
 	}
 }
 
@@ -204,11 +223,18 @@ func TestRemoveMissingFromDir(t *testing.T) {
 	p.Add(&auth.Auth{UID: "u1"})
 	p.Add(&auth.Auth{UID: "u2"})
 	p.SyncToDir([]*auth.Auth{{UID: "u2"}})
-	if p.Pick() == nil || p.Pick().UID != "u2" {
-		t.Fatal("u1 should be removed")
-	}
+	// 注意：不能用 p.Pick().UID 断言。默认积分策略下两者 credits 都是 0，
+	// 同分决胜看 UID，u1 被删后 u2 才成为唯一候选；但若切换策略则语义不同。
+	// 这里只验证"u1 已被剔除"这一 SyncToDir 的职责。
 	if _, ok := p.Status("u1"); ok {
 		t.Fatal("u1 should not exist")
+	}
+	st, ok := p.Status("u2")
+	if !ok {
+		t.Fatal("u2 should exist")
+	}
+	if p.Pick() == nil || p.Pick().UID != st.UID {
+		t.Fatal("剩余唯一账号应可被选中")
 	}
 }
 

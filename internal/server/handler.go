@@ -265,6 +265,8 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			break
 		}
 		tried[acct.UID] = true
+		// 标记"正在调用"：记录本次调用账号与时间戳，供面板高亮显示。
+		rt.Pool.NotifyUsed(acct.UID)
 		if acct.NeedsRefresh(h.cfg.RefreshSkew) {
 			log.Printf("refresh start platform=%s uid=%s reason=request", rt.Kind, acct.UID)
 			if err := rt.Upstream.RefreshToken(acct); err != nil {

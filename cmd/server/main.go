@@ -45,6 +45,10 @@ func main() {
 	for _, a := range auths {
 		p.Add(a)
 	}
+	if strat, ok := pool.ParseStrategy(cfg.Strategy); ok {
+		p.SetStrategy(strat)
+		log.Printf("选号策略：%s（%s）", strat, strat.Label())
+	}
 
 	up := upstream.New()
 	up.HTTP.Timeout = time.Duration(cfg.Upstream.TimeoutSeconds) * time.Second
@@ -60,6 +64,7 @@ func main() {
 		Pool:         p,
 		Upstream:     up,
 		APIKey:       cfg.APIKey,
+		MaxRotate:    cfg.MaxRotate,
 		HardCooldown: cfg.HardCreditDur,
 		SoftCooldown: cfg.SoftRateDur,
 		ErrThreshold: cfg.Cooldown.ErrThresh,

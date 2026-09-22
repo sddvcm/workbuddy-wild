@@ -322,12 +322,10 @@ func (a *App) OnShutdown(ctx context.Context) {
 
 // panelRect 计算面板最终位置与尺寸。
 // 位置优先级：用户拖拽保存的位置（clamp 回工作区）> 贴任务栏/工作区右下角。
-// 高度随账号数量自适应：0 账号基础高度 500，每 +1 账号增高 55（账号卡片实测约 55px），
-// 最多 4 个封顶（列表内部滚动）。退出按钮用 margin-top:auto 贴底，无需精确高度。
+// 尺寸固定宽 760 × 高 560（双栏布局：左账号列表 / 右设置），不随账号数变化，
+// 账号列表在左栏内部滚动，避免账号变多时反复调整窗口大小。
 func (a *App) panelRect() (x, y, pw, ph int) {
-	pw = 270
-	n := a.totalAccounts()
-	ph = 500 + minInt(n, 4)*55
+	pw, ph = 760, 560
 	waX, waY, waW, waH := winutil.WorkArea()
 	if int(waW) < pw {
 		pw = int(waW)
@@ -398,14 +396,7 @@ func (a *App) savedPanelPos() (int, int, bool) {
 	return p.X, p.Y, true
 }
 
-func minInt(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
-}
-
-// positionPanel 把面板定位到右下角（贴任务栏），尺寸按账号数自适应。
+// positionPanel 把面板定位到右下角（贴任务栏），尺寸固定为双栏布局大小。
 func (a *App) positionPanel() {
 	a.resizePanel()
 }
@@ -541,6 +532,15 @@ type AccountView struct {
 	LastCheckinOK  bool   `json:"last_checkin_ok"`
 	LastCheckinAt  string `json:"last_checkin_at"`
 	LastCheckinMsg string `json:"last_checkin_msg"`
+
+	// LastUsedAt 最近一次被调用时间（空 = 从未调用）。
+	LastUsedAt string `json:"last_used_at"`
+	// LastCallCredits 上次调用时的积分快照。
+	LastCallCredits int64 `json:"last_call_credits"`
+	// InUse 是否正在被调用（由 LastUsedAt 在 inUseWindow 内推断）。
+	InUse bool `json:"in_use"`
+	// ExpiresAt 凭证到期时间（Unix 秒，0 = 未知），优先过期策略会用到。
+	ExpiresAt int64 `json:"expires_at"`
 }
 
 // State 面板初始数据。
@@ -557,6 +557,8 @@ type State struct {
 	Version        string        `json:"version"`
 	Autostart      bool          `json:"autostart"`
 	Running        bool          `json:"running"`
+	// Strategy 当前全局选号策略（credits / expire / roundrobin）。
+	Strategy string `json:"strategy"`
 }
 
 // GetState 返回面板初始数据。
@@ -573,32 +575,95 @@ func (a *App) GetState() State {
 		Version:        Version,
 		Autostart:      winutil.AutostartEnabled(),
 		Running:        a.serverRunning(),
+		Strategy:       string(a.currentStrategy()),
 	}
 	st.Accounts = a.accountViews()
 	return st
 }
 
+// inUseWindow 「正在调用」的时间窗：最近 N 秒内被使用过的账号标记为调用中。
+// 单次请求多为数秒，窗口取 5s 覆盖典型耗时；更长请求会有轻微滞后显示。
+const inUseWindow = 5 * time.Second
+
 // accountViews 账号列表（按 UID 排序）。
 func (a *App) accountViews() []AccountView {
 	statuses := a.allStatuses()
+	now := time.Now()
 	out := make([]AccountView, 0, len(statuses))
 	for _, s := range statuses {
+		au := a.authByUID(s.UID)
+		var expires int64
+		if au != nil {
+			expires = au.ExpiresAt
+		}
+		inUse := !s.LastUsedAt.IsZero() && now.Sub(s.LastUsedAt) < inUseWindow
 		out = append(out, AccountView{
-			UID:            s.UID,
-			Group:          a.accountGroup(s.UID),
-			Nickname:       s.Nickname,
-			Credits:        s.Credits,
-			Cooling:        s.Cooling,
-			Until:          fmtTime(s.Until),
-			Reason:         s.Reason,
-			Disabled:       s.Disabled,
-			ErrCount:       s.ErrCount,
-			LastCheckinOK:  s.LastCheckinOK,
-			LastCheckinAt:  fmtTime(s.LastCheckinAt),
-			LastCheckinMsg: s.LastCheckinMsg,
+			UID:             s.UID,
+			Group:           a.accountGroup(s.UID),
+			Nickname:        s.Nickname,
+			Credits:         s.Credits,
+			Cooling:         s.Cooling,
+			Until:           fmtTime(s.Until),
+			Reason:          s.Reason,
+			Disabled:        s.Disabled,
+			ErrCount:        s.ErrCount,
+			LastCheckinOK:   s.LastCheckinOK,
+			LastCheckinAt:   fmtTime(s.LastCheckinAt),
+			LastCheckinMsg:  s.LastCheckinMsg,
+			LastUsedAt:      fmtTime(s.LastUsedAt),
+			LastCallCredits: s.LastCallCredits,
+			InUse:           inUse,
+			ExpiresAt:       expires,
 		})
 	}
 	return out
+}
+
+// authByUID 跨平台按 UID 找凭证（找不到返回 nil）。
+func (a *App) authByUID(uid string) *auth.Auth {
+	_, au := a.findRuntimeAuth(uid)
+	return au
+}
+
+// currentStrategy 返回当前生效的全局策略（取第一个运行时的策略）。
+func (a *App) currentStrategy() pool.Strategy {
+	if rt := a.firstRuntime(); rt != nil && rt.Pool != nil {
+		return rt.Pool.GetStrategy()
+	}
+	return pool.StrategyCredits
+}
+
+// SetStrategy 切换全局选号策略：两个平台同时生效并写回 config.json。
+func (a *App) SetStrategy(name string) error {
+	strat, ok := pool.ParseStrategy(name)
+	if !ok {
+		return fmt.Errorf("未知策略：%s", name)
+	}
+	for _, rt := range a.runtimes {
+		if rt != nil && rt.Pool != nil {
+			rt.Pool.SetStrategy(strat)
+		}
+	}
+	a.mu.Lock()
+	a.cfg.Strategy = string(strat)
+	err := config.Save(a.cfg, a.cfgPath)
+	a.mu.Unlock()
+	if err != nil {
+		return err
+	}
+	log.Printf("选号策略已切换：%s（%s）", strat, strat.Label())
+	a.emitAccounts()
+	return nil
+}
+
+// GetStrategy 返回当前策略（供前端初始化）。
+func (a *App) GetStrategy() string {
+	return string(a.currentStrategy())
+}
+
+// GetAccounts 返回账号视图快照（供前端轮询「正在调用」状态）。
+func (a *App) GetAccounts() []AccountView {
+	return a.accountViews()
 }
 
 // accountGroup 返回账号所属分组（workbuddy/traework）。

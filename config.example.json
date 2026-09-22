@@ -7,6 +7,8 @@
   "auth_dir": "./auths",
   "state_file": "./data/state.json",
   "region": "cn",
+  "strategy": "credits",
+  "max_rotate": 3,
   "cooldown": {
     "hard_credit": "12h",
     "soft_rate": "60s",

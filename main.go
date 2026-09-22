@@ -95,6 +95,12 @@ func main() {
 	for _, a := range trAuths {
 		trPool.Add(a)
 	}
+	// 全局策略：两个平台共用一个选号策略（面板可运行时切换）。
+	if strat, ok := pool.ParseStrategy(cfg.Strategy); ok {
+		wbPool.SetStrategy(strat)
+		trPool.SetStrategy(strat)
+		log.Printf("选号策略：%s（%s）", strat, strat.Label())
+	}
 
 	wbUp := upstream.New()
 	wbUp.HTTP.Timeout = time.Duration(cfg.Upstream.TimeoutSeconds) * time.Second
@@ -120,6 +126,7 @@ func main() {
 	h := server.NewHandler(server.Config{
 		Runtimes:     runtimes,
 		APIKey:       cfg.APIKey,
+		MaxRotate:    cfg.MaxRotate,
 		HardCooldown: cfg.HardCreditDur,
 		SoftCooldown: cfg.SoftRateDur,
 		ErrThreshold: cfg.Cooldown.ErrThresh,
@@ -198,9 +205,9 @@ func runGUI(a *app.App, webviewPath string) {
 	}()
 	err := wails.Run(&options.App{
 		Title:             "WorkBuddy-Wild",
-		Width:             270,
-		Height:            640,
-		MinWidth:          240,
+		Width:             760,
+		Height:            560,
+		MinWidth:          680,
 		MinHeight:         420,
 		Frameless:         true,
 		StartHidden:       true,
