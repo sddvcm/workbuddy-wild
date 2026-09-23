@@ -6,11 +6,13 @@
   "frontend:build": "",
   "frontend:dev:watcher": "",
   "frontend:dev:serverUrl": "auto",
-  "author": { "name": "" },
+  "author": {
+    "name": ""
+  },
   "info": {
     "companyName": "",
     "productName": "WorkBuddy Wild",
-    "productVersion": "0.4.0",
+    "productVersion": "0.4.1",
     "copyright": "",
     "comments": "WorkBuddy/CodeBuddy OpenAI 兼容代理 + 自动签到托盘工具"
   }

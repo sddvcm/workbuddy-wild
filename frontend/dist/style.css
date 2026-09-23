@@ -103,6 +103,27 @@ button, input, select, textarea, label, a,
 .btn.small { padding: 2px 8px; font-size: 11px; }
 .btn:disabled { opacity: 0.5; cursor: default; }
 
+/* 总积分横幅（账号列表上方） */
+.total-bar {
+  display: flex; align-items: baseline; gap: 8px;
+  padding: 7px 10px; margin-bottom: 7px; flex: none;
+  background: linear-gradient(135deg, rgba(37, 99, 235, 0.08), rgba(13, 148, 136, 0.08));
+  border: 1px solid var(--border); border-radius: 8px;
+}
+.total-label { font-size: 12px; color: var(--muted); flex: none; }
+.total-val {
+  font-size: 20px; font-weight: 600; line-height: 1.1;
+  font-family: var(--mono); color: var(--accent2); flex: none;
+}
+.total-sub { flex: 1; min-width: 0; text-align: right; }
+/* 数值变化时闪一下，提示"实时更新" */
+.total-val.bump { animation: total-bump 0.5s ease-out; }
+@keyframes total-bump {
+  0%   { transform: scale(1);    color: var(--ok); }
+  35%  { transform: scale(1.18); color: var(--ok); }
+  100% { transform: scale(1);    color: var(--accent2); }
+}
+
 /* 账号列表：占满左栏剩余高度，内部滚动（窗口高度固定） */
 .add-buttons { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; flex: none; }
 .acct-list {
@@ -283,3 +304,6 @@ button, input, select, textarea, label, a,
 :root[data-theme="dark"] ::-webkit-scrollbar-thumb { background: #4a4a52; }
 :root[data-theme="dark"] ::-webkit-scrollbar-thumb:hover { background: #5a5a64; }
 :root[data-theme="dark"] .toast { background: #45454e; color: #f2f2f4; }
+:root[data-theme="dark"] .total-bar {
+  background: linear-gradient(135deg, rgba(74, 140, 247, 0.14), rgba(52, 211, 153, 0.12));
+}

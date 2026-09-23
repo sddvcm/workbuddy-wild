@@ -114,6 +114,8 @@ function renderHostSelect() {
 function renderAccounts() {
   const box = $("acctList");
   if (!state || !state.accounts) return;
+  renderTotal();
+
   // 排序：正在调用 > 最近用过 > 其余（按积分降序），让活跃账号浮到顶部。
   const accts = state.accounts.slice().sort((a, b) => {
     if (a.in_use !== b.in_use) return a.in_use ? -1 : 1;
@@ -146,6 +148,37 @@ function renderAccounts() {
       </div>
     </div>`;
   }).join("");
+}
+
+// renderTotal 计算所有账号积分总和（实时更新）。
+// 变化时给数字加一次性动画，让"实时更新"看得见。
+let lastTotal = null;
+function renderTotal() {
+  const el = $("totalCredits");
+  const subEl = $("totalSub");
+  if (!el || !state || !state.accounts) return;
+  const accts = state.accounts;
+  const sum = accts.reduce((acc, a) => acc + (Number(a.credits) || 0), 0);
+  const shown = sum.toLocaleString();
+  if (el.textContent !== shown) {
+    el.textContent = shown;
+    if (lastTotal !== null && sum > lastTotal) {
+      el.classList.remove("bump");
+      void el.offsetWidth; // 强制重排以重启动画
+      el.classList.add("bump");
+    }
+    lastTotal = sum;
+  }
+  // 副标题：可用账号数 / 总数；有冷却或禁用时明确提示
+  const total = accts.length;
+  const usable = accts.filter((a) => !a.disabled && !a.cooling).length;
+  if (total === 0) {
+    subEl.textContent = "";
+  } else if (usable === total) {
+    subEl.textContent = `${total} 个账号`;
+  } else {
+    subEl.textContent = `${usable}/${total} 个可用`;
+  }
 }
 
 function accountStatus(a) {
