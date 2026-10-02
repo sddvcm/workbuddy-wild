@@ -25,6 +25,51 @@
 
 ## 更新记录
 
+### v0.7.1（2026-10-02）
+- **修复：模型名写错会「冤枉」地把整个账号池冷却**
+  - **用户反馈**：面板显示「冷却中（consecutive errors 至 10-02 15:38）」
+  - **现象**：5 个 workbuddy 账号**全部**被冷却 10 分钟，明明只是模型名的问题
+  - **根因链**：
+    1. 上游 `/v2/chat/completions` 返回 `400 {"code":11102,"msg":"model [Deepseek-V4.1-Flash] service info not found"}`
+       —— 模型名写成了**显示名**，上游要求**模型 ID**（见下）
+    2. `11102` 不属于已有的任何分类 → 落到 `default` 分支 → `NoteError`
+    3. 每次请求轮换 3 个账号、各记 1 次 `errCount`；`err_threshold=3`
+       → 第 3 轮（约 20 秒内）就把 5 个账号全部冷却 10 分钟
+  - **关键定性**：模型名不存在是**请求方参数错误**，与账号状态无关 ——
+    换任何账号、重试任何次数都不会成功。把它算作"账号连续错误"是**设计缺陷**。
+  - **修复**：
+    1. 新增错误类别 `ErrBadModel`，`Classify()` 识别
+       `service info not found` / `model not found` / `invalid model` / `unknown model`
+    2. handler 新增 `case provider.ErrBadModel`：**不计 errCount、不冷却账号**，
+       并 `break rotate` **立即终止轮换**（换号无用，没必要把池子白试一遍）
+    3. 错误返回从含糊的 `503 no_healthy_account（账号不可用）`
+       改为明确的 `400 model_not_available`，并在消息里**直接指出**要用 `/v1/models` 的 `id` 字段
+  - **新增 2 个测试**：
+    - `TestBadModelDoesNotCooldownAccounts` —— 3 个账号 + 阈值 1，
+      断言「只调上游 1 次」「全部账号仍健康」「errCount 全为 0」「返回 400」
+    - `TestGenericClientErrorStillCooldownsAccounts` —— **对照测试**，
+      确保普通 4xx 仍会正常冷却（没有把账号保护机制一并改坏）
+  - `TestClassify` 新增 5 组用例（含"余额不足优先级高于模型不存在"的对照）
+
+#### ★ 顺带纠正一个重要认知：模型名 ≠ 显示名
+
+**上游是按「模型 ID」精确匹配、且区分大小写的。** 客户端列表里看到的往往是
+**显示名**，两者经常不一致；直接拿显示名去调用会得到 `400 / 11102`。
+
+| 显示名（容易误填） | 真实模型 ID（必须填这个） |
+|---|---|
+| `Deepseek-V4.1-Flash` | `deepseek-v4.1-flash` |
+| `GLM-5.3` | `glm-5.3` |
+| `MiniMax-M3` | `minimax-m3` |
+| `Kimi-K3` | **`kimi-k3-1`**（注意 `-1` 后缀） |
+| `Kimi-K2.7-Code` | **`kimi-k2.7`**（词根不同！） |
+| `Hy4 preview` | `hy4-preview` |
+| `Space-Bunny` | `space-bunny` |
+
+后两个尤其危险 —— **不能靠"改小写"推出来**，必须查 `/v1/models`。
+
+> 正确做法：始终以 `GET /v1/models` 返回的 `id` 字段为准，不要手抄 UI 上的名字。
+
 ### v0.7.0（2026-10-02）
 - **模型名支持备注** —— 可在名称后随意追加说明，调用上游前自动剥离
   - **用户需求**：「能不能让模型名支持备注，如 workbuddy/deepseek-v4-flash（倍率0.11x），

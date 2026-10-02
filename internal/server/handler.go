@@ -263,6 +263,9 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 
 	tried := map[string]bool{}
 	var lastErr error
+	// rotate 标签用于"模型名错误"这种**换账号也没用**的场景提前退出，
+	// 避免把整个账号池都白试一遍（每次白试都会污染一个账号的 errCount）。
+rotate:
 	for i := 0; i < h.cfg.MaxRotate; i++ {
 		acct := rt.Pool.PickExcluding(tried)
 		if acct == nil {
@@ -306,6 +309,12 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				rt.Pool.Disable(acct.UID, "session dead")
 			case provider.ErrNotFound:
 				rt.Pool.Cooldown(acct.UID, pool.CoolSoft, h.cfg.SoftCooldown, "upstream 404")
+			case provider.ErrBadModel:
+				// 模型 ID 不存在 —— 这是**请求方参数错误**，换任何账号结果都一样。
+				// 因此：不计 errCount、不冷却账号，并立刻终止轮换。
+				// （否则一次写错模型名就会把整个账号池连续冷却 10 分钟。）
+				lastErr = &provider.Error{Kind: kind, Status: status, Msg: string(respBody)}
+				break rotate
 			default:
 				rt.Pool.NoteError(acct.UID, h.cfg.ErrThreshold, h.cfg.ErrCooldown)
 			}
@@ -329,6 +338,17 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	msg := "all accounts unavailable (cooling/disabled)"
 	if lastErr != nil {
 		msg += ": " + lastErr.Error()
+	}
+	// 模型名错误：以 400 明确返回并指路，不要伪装成"账号不可用"（会让人误以为是账号问题）。
+	if lastErr != nil {
+		var ue *provider.Error
+		if errors.As(lastErr, &ue) && ue.Kind == provider.ErrBadModel {
+			writeOpenAIError(w, http.StatusBadRequest, "model_not_available", fmt.Sprintf(
+				"model %q is not available upstream. 上游按「模型 ID」精确匹配且区分大小写，"+
+					"请填 /v1/models 返回的 id（而不是客户端展示的名字）。上游原始响应: %s",
+				peek.Model, ue.Msg))
+			return
+		}
 	}
 	writeOpenAIError(w, http.StatusServiceUnavailable, "no_healthy_account", msg)
 }

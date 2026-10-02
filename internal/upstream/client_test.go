@@ -26,6 +26,13 @@ func TestClassify(t *testing.T) {
 		{401, `Offline user session not found`, ErrSessionDead},
 		{401, `{"code":12153,"msg":"Offline user session not found"}`, ErrSessionDead},
 		{401, `{"code":9999,"msg":"bad token"}`, ErrClient},
+		// 模型 ID 不存在：必须归为 BadModel，绝不能被当作账号故障去冷却账号。
+		// 真实响应：模型名写成显示名（如 Deepseek-V4.1-Flash 而非 deepseek-v4.1-flash）时。
+		{400, `{"code":11102,"msg":"model [Deepseek-V4.1-Flash] service info not found"}`, ErrBadModel},
+		{400, `{"code":11102,"msg":"model [Kimi-K3] service info not found"}`, ErrBadModel},
+		{400, `{"msg":"invalid model"}`, ErrBadModel},
+		// 对照：余额不足优先级更高，不能被 badModel 抢走
+		{400, `{"code":11102,"msg":"service info not found, 积分不足"}`, ErrHardCredit},
 		{500, `boom`, ErrServer},
 		{503, `unavailable`, ErrServer},
 		{200, ``, ErrNone},

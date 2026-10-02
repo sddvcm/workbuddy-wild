@@ -25,6 +25,7 @@ const (
 	ErrSoftRate    = provider.ErrSoftRate    // 429 软限流 → 短冷却
 	ErrSessionDead = provider.ErrSessionDead // 401 + 12153 offline session 失效 → 禁用
 	ErrNotFound    = provider.ErrNotFound    // 404 上游偶发 → 短冷却不累计 errCount（防雪崩）
+	ErrBadModel    = provider.ErrBadModel    // 模型 ID 不存在 → 请求方参数错误，不冷却账号
 	ErrServer      = provider.ErrServer      // 5xx 上游故障
 	ErrClient      = provider.ErrClient      // 其他 4xx / 业务错误
 )
@@ -42,6 +43,24 @@ var hardMarkers = []string{
 
 var sessionDeadMarkers = []string{"Offline user session not found", "12153"}
 
+// badModelMarkers 模型 ID 不存在。
+//
+// ★ 这是一个反复踩到的坑：上游是**按模型 ID 精确匹配、且区分大小写**的，
+// 而客户端列表里展示的往往是「显示名」。两者经常不一致，例如
+//
+//	显示名（客户端看到的）      真实 ID（必须发给上游的）
+//	Deepseek-V4.1-Flash    ->  deepseek-v4.1-flash
+//	GLM-5.3                ->  glm-5.3
+//	Kimi-K3                ->  kimi-k3-1      （连词根都不同！）
+//	Kimi-K2.7-Code         ->  kimi-k2.7      （连词根都不同！）
+//
+// 传错就会得到 {"code":11102,"msg":"model [X] service info not found"}。
+//
+// 关键定性：这是**请求方参数错误**，与账号状态毫无关系 ——
+// 换任何账号、重试任何次数都不会成功。因此**绝不能**计入账号 errCount，
+// 否则一次写错模型名就会把整个账号池连续冷却（曾实际发生）。
+var badModelMarkers = []string{"service info not found", "model not found", "invalid model", "unknown model"}
+
 // Classify 按 HTTP 状态码 + body 判定错误类别。
 func Classify(status int, body string) ErrKind {
 	if status == http.StatusPaymentRequired {
@@ -56,6 +75,12 @@ func Classify(status int, body string) ErrKind {
 	for _, m := range sessionDeadMarkers {
 		if strings.Contains(body, m) {
 			return ErrSessionDead
+		}
+	}
+	// 模型 ID 不存在：优先于 4xx 兜底，避免被误当作"账号故障"而触发冷却。
+	for _, m := range badModelMarkers {
+		if strings.Contains(lower, strings.ToLower(m)) {
+			return ErrBadModel
 		}
 	}
 	if status == http.StatusTooManyRequests {

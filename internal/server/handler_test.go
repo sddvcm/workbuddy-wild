@@ -580,3 +580,85 @@ func TestChatCompletionsPlainModelStillWorks(t *testing.T) {
 		t.Fatalf("model=%q, want glm-5.2", gotModel)
 	}
 }
+
+// ---- 模型 ID 不存在：不得拖累账号池 ----
+//
+// 回归背景（真实事故）：上游按「模型 ID」精确匹配且区分大小写。
+// 用户在 models.json 里填了上游的**显示名**（如 Deepseek-V4.1-Flash），
+// 而上游真实 ID 是 deepseek-v4.1-flash，于是每次请求都返回
+//
+//	400 {"code":11102,"msg":"model [Deepseek-V4.1-Flash] service info not found"}
+//
+// 旧实现把 11102 当"其他 4xx"，走 default 分支 -> NoteError。
+// 每次请求轮换 3 个账号、各记 1 次错误，第 3 轮就把 5 个 workbuddy 账号
+// 全部冷却 10 分钟（面板显示"冷却中（consecutive errors 至 …）"）。
+//
+// 正确行为：这是**请求方参数错误**，换任何账号都一样 ->
+//  1. 不计 errCount、不冷却账号
+//  2. 立即停止轮换（只试 1 次）
+//  3. 以 400 + model_not_available 明确告知，而不是 503 "账号不可用"
+func TestBadModelDoesNotCooldownAccounts(t *testing.T) {
+	var calls int
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		calls++
+		return 400, `{"code":11102,"msg":"model [Deepseek-V4.1-Flash] service info not found"}`, false
+	})
+	a1 := &auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999}
+	a2 := &auth.Auth{UID: "u2", AccessToken: "at2", ExpiresAt: 9999999999}
+	a3 := &auth.Auth{UID: "u3", AccessToken: "at3", ExpiresAt: 9999999999}
+	p := testPoolWith(a1, a2, a3)
+	// ErrThreshold=1：若仍会计数，第一次就能把账号冷却，问题立刻暴露。
+	h := NewHandler(Config{Pool: p, Upstream: up, MaxRotate: 3, ErrThreshold: 1, ErrCooldown: time.Hour})
+
+	req := httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"workbuddy/Deepseek-V4.1-Flash","messages":[{"role":"user","content":"hi"}]}`))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("模型不存在应返回 400，实际 %d body=%s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "model_not_available") {
+		t.Errorf("错误码应为 model_not_available，实际 body=%s", rec.Body.String())
+	}
+	if calls != 1 {
+		t.Errorf("应只试 1 次即停止（换号无用），实际调用上游 %d 次", calls)
+	}
+	for _, au := range []*auth.Auth{a1, a2, a3} {
+		st, ok := p.Status(au.UID)
+		if !ok {
+			t.Fatalf("账号 %s 丢失", au.UID)
+		}
+		if st.Cooling {
+			t.Errorf("账号 %s 被错误冷却（reason=%q until=%v）—— 模型名错误与账号无关",
+				au.UID, st.Reason, st.Until)
+		}
+		if st.Disabled {
+			t.Errorf("账号 %s 被错误禁用", au.UID)
+		}
+		if st.ErrCount != 0 {
+			t.Errorf("账号 %s errCount=%d，应为 0", au.UID, st.ErrCount)
+		}
+	}
+}
+
+// 对照测试：**普通** 4xx（不是模型不存在）仍必须走 errCount -> 冷却。
+// 防止上面的修复把账号保护机制一并改坏（"别的账号的错"仍要隔离）。
+func TestGenericClientErrorStillCooldownsAccounts(t *testing.T) {
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		return 400, `{"code":9999,"msg":"some unrelated bad request"}`, false
+	})
+	a1 := &auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999}
+	p := testPoolWith(a1)
+	h := NewHandler(Config{Pool: p, Upstream: up, MaxRotate: 1, ErrThreshold: 1, ErrCooldown: time.Hour})
+
+	req := httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"workbuddy/glm-5.2","messages":[{"role":"user","content":"hi"}]}`))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	st, _ := p.Status("u1")
+	if !st.Cooling {
+		t.Errorf("普通 4xx 达到阈值后应冷却账号，实际 cooling=%v reason=%q", st.Cooling, st.Reason)
+	}
+}
