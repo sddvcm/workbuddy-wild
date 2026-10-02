@@ -43,7 +43,7 @@ var hardMarkers = []string{
 
 var sessionDeadMarkers = []string{"Offline user session not found", "12153"}
 
-// badModelMarkers 模型 ID 不存在。
+// badModelMarkers 模型 ID 不存在 / 参数不被后端接受。
 //
 // ★ 这是一个反复踩到的坑：上游是**按模型 ID 精确匹配、且区分大小写**的，
 // 而客户端列表里展示的往往是「显示名」。两者经常不一致，例如
@@ -56,10 +56,25 @@ var sessionDeadMarkers = []string{"Offline user session not found", "12153"}
 //
 // 传错就会得到 {"code":11102,"msg":"model [X] service info not found"}。
 //
+// ★ 11103「后端不支持」与 11102 同族（2026-10-02 实测补充）：
+//
+//	{"code":11103,"msg":"Backend [hunyuan-stream] is not supported"}
+//
+// 含义是「该模型 ID 存在，但不支持当前调用方式（如非流式）」，
+// 同样是**请求方参数问题**，换账号、重试都无用。若不识别，
+// 会落到 default 分支触发 NoteError —— 一次错误调用就把 3 个账号
+// 各 +1 errCount（曾实际发生，直接导致账号池冷却）。
+//
 // 关键定性：这是**请求方参数错误**，与账号状态毫无关系 ——
 // 换任何账号、重试任何次数都不会成功。因此**绝不能**计入账号 errCount，
 // 否则一次写错模型名就会把整个账号池连续冷却（曾实际发生）。
 var badModelMarkers = []string{"service info not found", "model not found", "invalid model", "unknown model"}
+
+// badModelCodes 请求方参数错误的业务码（`"code":11102` / `"code":11103`）。
+// 与 badModelMarkers 互补：文案会变，业务码稳定，双通道判定更耐改版。
+//
+// 注意用**带引号的完整 code 片段**匹配，避免 "11103" 出现在正文其他位置时误判。
+var badModelCodes = []string{`"code":11102`, `"code":11103`, `"code": 11102`, `"code": 11103`}
 
 // Classify 按 HTTP 状态码 + body 判定错误类别。
 func Classify(status int, body string) ErrKind {
@@ -77,9 +92,16 @@ func Classify(status int, body string) ErrKind {
 			return ErrSessionDead
 		}
 	}
-	// 模型 ID 不存在：优先于 4xx 兜底，避免被误当作"账号故障"而触发冷却。
+	// 模型 ID 不存在 / 调用方式不被支持：优先于 4xx 兜底，
+	// 避免被误当作"账号故障"而触发冷却。
+	// 双通道：业务码（稳定）+ 文案（兜底旧版/变体）。
+	for _, c := range badModelCodes {
+		if strings.Contains(body, c) {
+			return ErrBadModel
+		}
+	}
 	for _, m := range badModelMarkers {
-		if strings.Contains(lower, strings.ToLower(m)) {
+		if strings.Contains(lower, strings.ToLower(m)) || strings.Contains(body, m) {
 			return ErrBadModel
 		}
 	}

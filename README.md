@@ -25,6 +25,46 @@
 
 ## 更新记录
 
+### v0.7.3（2026-10-02）
+- **修复两个仍在漏的错误识别缺口**（v0.7.2 遗留）
+
+  **D1 · workbuddy `11103` 未归入请求方错误**
+  - **现象**：调用某模型得到 `400 {"code":11103,"msg":"Backend [hunyuan-stream] is not supported"}`，
+    该错误落到 `default` 分支触发 `NoteError` —— 一次调用就让 3 个账号各 `+1 errCount`，
+    逼近 `err_threshold=3` 后整池冷却
+  - **根因**：`badModelMarkers` 只匹配文案（`service info not found` 等），
+    `11103` 的文案 `is not supported` 不在其中，业务码也没判
+  - **修复**：新增 `badModelCodes`（`"code":11102` / `"code":11103`，含无空格变体）
+    → `ErrBadModel`。**业务码 + 文案双通道**：码稳定、文案兜底旧版
+  - **定性**：`11103` 与 `11102` 同族 —— 模型 ID 存在但不支持当前调用方式，
+    同样是请求方参数问题，换账号无用
+
+  **D2 · traework `event:error` 信封未被完整识别**
+  - **现象**：`kimi-k3` 返回 `code:1005`（权益不足）时错误被**漏过**，当作正常回答透传
+  - **根因**：v0.7.2 只按**错误文案**匹配（`solo error code=`），
+    而信封型错误的 `message` 恒为空（`{"code":1005,"message":"","data":null}`），
+    正文里根本没有可匹配的文案
+  - **修复**：
+    1. `provider.InBandPattern` 抽象出「怎么认」与「算哪类错」：
+       支持 `Contains`（文案）与 `Event`（SSE 事件名）两种判别方式；
+       信封类带 `Drop: true` 可**立即返回**，不必白等一个预读周期
+    2. traework 嗅探改为「文案型 + `event:error` 信封型」双模式；
+       信封 message 为空时补兜底文案，交由 `Classify()` 按 `code` 细分
+    3. `SOLOStreamError.Kind()` 语义修正：不再把所有非 1005 归 `ErrClient`，
+       而是与「换账号有没有用」对齐 ——
+       `1005`→权益不足、`1001/4001/400`→请求方错误、其余→`ErrClient`
+    4. **流式层不再把错误伪装成 `delta.content`**：改用 OpenAI 标准的
+       `event: error` + `data: {"error":{...}}` 下发，并保留 `[DONE]` 收尾。
+       旧实现以 `delta.content` + `finish_reason:"stop"` 返回，
+       客户端会把报错渲染成"模型的回答"，且无法与正常结束区分
+    5. 嗅探的「提前放行」加 `minSniffBeforeRelease`（8 KB）门槛：
+       上游可能在若干条正常 `output` **之后**才发 `event:error`，
+       原先看到第一条 `content` 就 break 会漏掉后到的错误帧
+
+- **回归测试**：新增 6 个用例覆盖两条真实错误形态 ——
+  文案型（`solo error code=4001`）、信封型（`event:error` + `code:1005`，含**晚到**场景）、
+  `11102`/`11103` 双码分类、流式层「错误不得伪装成 content」
+
 ### v0.7.2（2026-10-02）
 - **修复：TraeWork 的「200 伪装错误」被当成模型回答透传给客户端**
   - **现象**：给 traework 传一个上游不存在的模型，客户端**不报错**，而是显示一段

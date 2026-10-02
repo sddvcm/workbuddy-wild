@@ -324,6 +324,28 @@ rotate:
 		defer rc.Close()
 		rt.Pool.NoteSuccess(acct.UID)
 		if peek.Stream {
+			// 流式路径：上游可能在流**中途**才发错误（超出嗅探预读窗口的
+			// 场景）。StreamErrors 让实现方把这类错误回调出来，
+			// 以便按类别冷却账号 —— 否则错误只以 SSE 事件形式下发给
+			// 客户端，账号状态却仍被记为"成功"。
+			if se, ok := rt.Upstream.(provider.StreamErrorReporter); ok {
+				_ = se.StreamWithError(w, rc, func(kind provider.ErrKind, msg string) {
+					switch kind {
+					case provider.ErrHardCredit:
+						rt.Pool.Cooldown(acct.UID, pool.CoolHard, h.cfg.HardCooldown, "流内错误: "+msg)
+					case provider.ErrSoftRate, provider.ErrNotFound:
+						rt.Pool.Cooldown(acct.UID, pool.CoolSoft, h.cfg.SoftCooldown, "流内错误: "+msg)
+					case provider.ErrSessionDead:
+						rt.Pool.Disable(acct.UID, "流内 session dead")
+					case provider.ErrBadModel:
+						// 请求方错误：与账号无关，不冷却、不记错
+						log.Printf("stream in-band bad-model uid=%s: %s", acct.UID, msg)
+					default:
+						rt.Pool.NoteError(acct.UID, h.cfg.ErrThreshold, h.cfg.ErrCooldown)
+					}
+				})
+				return
+			}
 			_ = rt.Upstream.Stream(w, rc)
 			return
 		}

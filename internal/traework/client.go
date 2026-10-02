@@ -37,15 +37,50 @@ var sessionDeadMarkers = []string{"login", "token 失效", "token invalid", "ses
 // 选词刻意保守，只取足够独特的片段，避免误伤正常回答里恰好出现的词。
 var inBandErrorMarkers = []string{"solo error code=", "the param is invalid"}
 
+// inBandPatterns 声明 traework 200 正文里可能出现的**各类**错误。
+//
+// ★ 两套错误形态必须分开判别（2026-10-02 实测）：
+//
+//	形态 A：文本型，塞在 content 里，有独特文案
+//	  data: {"choices":[{"delta":{"content":"solo error code=4001 msg=..."}}]}
+//	  → 靠文案片段识别（Contains），且**必须等正文收全**才能拿到完整消息。
+//
+//	形态 B：信封型，走 SSE 的 event:error，message 恒为空
+//	  event:error
+//	  data:{"code":1005,"message":"","data":null}
+//	  → 靠**事件名**识别（Event）。若仍按文案匹配，message 为空时无从匹配，
+//	    错误会被漏过并当成正常回答（曾实际发生：kimi-k3 的 code:1005 漏过）。
+//
+// 顺序有意义：形态 A 在前（有具体消息，优先返回更多人可读的文案）。
+var inBandPatterns = []provider.InBandPattern{
+	{
+		Name:     "solo-text",
+		Contains: inBandErrorMarkers,
+		Kind:     provider.ErrBadModel,
+	},
+	{
+		Name:  "sse-error-envelope",
+		Event: "error",
+		Kind:  provider.ErrUnknown, // 实际类别由 Classify 按内容细分
+		Drop:  true,                // 信封本身即判据，无需等正文
+	},
+}
+
 // inBandErrorLookup 供 provider.SniffInBandError 使用的判定函数。
-func inBandErrorLookup(prefix string) (string, bool) {
+func inBandErrorLookup(prefix string) (string, bool, bool) {
 	lower := strings.ToLower(prefix)
-	for _, m := range inBandErrorMarkers {
-		if strings.Contains(lower, strings.ToLower(m)) {
-			return provider.FirstSSEContent(prefix), true
+	for _, p := range inBandPatterns {
+		if p.Event != "" && provider.SSEEventName(prefix, p.Event) {
+			// 信封类：消息可能为空，交给 Classify 按 code 细分。
+			return "", true, p.Drop
+		}
+		for _, m := range p.Contains {
+			if strings.Contains(lower, strings.ToLower(m)) {
+				return provider.FirstSSEContent(prefix), true, false
+			}
 		}
 	}
-	return "", false
+	return "", false, false
 }
 
 // Classify 按 HTTP 状态码 + body 判定错误类别。
@@ -57,6 +92,9 @@ func Classify(status int, body string) provider.ErrKind {
 			return provider.ErrBadModel
 		}
 	}
+	// traework 权益/套餐不足：实为 SSE event:error 的 code=1005，message 为空。
+	// 归一化后 body 形如 {"code":1005,"message":"","data":null}，
+	// 必须按 code 判定 —— 文案为空时任何关键词匹配都无效。
 	if strings.Contains(body, `"code":1005`) || (strings.Contains(body, "1005") && strings.Contains(lower, "plan")) {
 		return provider.ErrHardCredit
 	}
@@ -76,6 +114,17 @@ func Classify(status int, body string) provider.ErrKind {
 	}
 	if status >= 500 {
 		return provider.ErrServer
+	}
+	// ★ 嗅探命中后统一归一化成 400，因此这里要把「确实是错误但还没细分」
+	// 的 400 与「真正的账号无关请求方错误」区分开：
+	//   - 有 event:error 信封特征 / 有具体业务 code → 请求方错误
+	//     （模型不可用、参数非法等），换账号无用 → ErrBadModel
+	//   - 其余 4xx → ErrClient（可能累计 errCount）
+	// 注意 1005 已在上面被截走（权益不足 → ErrHardCredit）。
+	if status == http.StatusBadRequest {
+		if strings.Contains(body, `"code":`) || provider.SSEEventName(body, "error") {
+			return provider.ErrBadModel
+		}
 	}
 	if status >= 400 {
 		return provider.ErrClient
@@ -270,15 +319,24 @@ func (c *Client) ChatStream(a *auth.Auth, body []byte) (rc io.ReadCloser, status
 		log.Printf("traework chat_stream uid=%s: upstream %d %s body=%s", a.UID, resp.StatusCode, kind, truncate(string(raw), 200))
 		return nil, resp.StatusCode, raw, nil
 	}
-	// HTTP 200 也可能是错误（见 inBandErrorMarkers）：预读开头若干字节做嗅探，
+	// HTTP 200 也可能是错误（见 inBandPatterns）：预读开头若干字节做嗅探，
 	// 命中则归一化成 400 交给上层 Classify；未命中则原样放行，流内容不丢。
 	sniffed, msg, hit := provider.SniffInBandError(resp.Body, inBandErrorLookup, 64<<10, 8*time.Second)
 	if hit {
+		// 信封类错误的 message 恒为空，兜底补上分类名，避免上层拿到空字符串。
+		if strings.TrimSpace(msg) == "" {
+			msg = inBandEnvelopeFallback
+		}
 		log.Printf("traework chat_stream uid=%s: upstream 200 in-band error: %s", a.UID, truncate(msg, 200))
 		return nil, http.StatusBadRequest, []byte(msg), nil
 	}
 	return sniffed, resp.StatusCode, nil, nil
 }
+
+// inBandEnvelopeFallback 是信封类错误（message 为空）的兜底文案。
+// 必须**同时**带上分类关键信息，因为上层 Classify 是按 body 关键词
+// 细分错误类别的（1005 → 长冷却 / 其余 → 账号无关的请求方错误）。
+const inBandEnvelopeFallback = `{"code":1005,"message":"solo error: insufficient plan/credit (event:error)","data":null}`
 
 func (c *Client) FetchModels(a *auth.Auth) ([]provider.ModelInfo, error) {
 	// traework 上游 llm_utils_chat 强制 stream=true（见 PrepareBody），
@@ -424,11 +482,13 @@ func (c *Client) CheckinClaim(a *auth.Auth) error {
 // 换号请求有一定概率返回 **9074「当前参与用户太多，请稍后再试」**。
 // 该码字面即"暂时性限流"，实测**同一操作稍后重试就会成功**
 // （2026-10-02 实测：程序第 1 次换号撞上 9074 后放弃，导致账号当天没签到；
-//  同一天手工重试随机号，连续多次都返回 code=0 并成功 +100）。
+//
+//	同一天手工重试随机号，连续多次都返回 code=0 并成功 +100）。
 //
 // 早期版本把 9074 定性为"设备号未注册、重试无用"并只换一次号 —— 双重错误：
-//   ① 9074 是**瞬时限流**，不是设备号非法（重试即可通过）
-//   ② 只试一次，正好撞上 9074 就彻底放弃
+//
+//	① 9074 是**瞬时限流**，不是设备号非法（重试即可通过）
+//	② 只试一次，正好撞上 9074 就彻底放弃
 //
 // 现在：最多尝试 maxRotateAttempts 个不同设备号；一旦额度真的增加立刻返回。
 //
@@ -759,10 +819,11 @@ func (c *Client) UserResource(a *auth.Auth) (remain int64, err error) { return c
 // 因此判据：**entitlement_id 以 "checkin_" 开头 且日期段为今天**。
 //
 // ⚠️ 历史踩坑（务必保留这段说明）：
-//   v0.6.3 用"今天有任意新包"判定 → 把月初包误算成签到到账
-//   v0.6.5 改用「时间窗(hour≥1) + 金额(≤300)」启发式 → 能工作但很脆弱：
-//          若签到发生在凌晨、或签到额度调整 >300，就会再次误判。
-//   v0.6.7 换成读 entitlement_id —— **不再依赖任何猜测**。
+//
+//	v0.6.3 用"今天有任意新包"判定 → 把月初包误算成签到到账
+//	v0.6.5 改用「时间窗(hour≥1) + 金额(≤300)」启发式 → 能工作但很脆弱：
+//	       若签到发生在凌晨、或签到额度调整 >300，就会再次误判。
+//	v0.6.7 换成读 entitlement_id —— **不再依赖任何猜测**。
 //
 // 返回 (是否有签到到账, 到账额度, error)。
 func (c *Client) CurrentDayGrant(a *auth.Auth) (granted bool, amount float64, err error) {
@@ -971,6 +1032,7 @@ var usedFieldNames = []string{
 //   - "credits" 单独出现时语义不定（可能是签到奖励值，实测恒为 150）
 //   - "quota" 通常是**容器对象**而非标量，收进来只会在 toInt64 时失败
 //   - "total" 太泛，可能命中"总记录数"之类的分页字段
+//
 // 宁可少认字段、把包判为"解析失败"，也不要认错字段得出一个假余额。
 var limitFieldNames = []string{
 	"credits_limit", "credit_limit", "limit_credits",
@@ -1258,6 +1320,17 @@ func (c *Client) GetUserInfo(a *auth.Auth) (uid, nickname, enterpriseID string, 
 func (c *Client) Classify(status int, body string) provider.ErrKind { return Classify(status, body) }
 func (c *Client) Stream(w http.ResponseWriter, r io.Reader) error   { return Stream(w, r) }
 func (c *Client) Aggregate(r io.Reader) (map[string]any, error)     { return Aggregate(r) }
+
+// StreamWithError 实现 provider.StreamErrorReporter：
+// 流式转换途中遇到上游错误时回调 (分类, 描述)，供上层冷却账号。
+// 错误本身仍会以下发的 SSE `event: error` 事件交给客户端。
+func (c *Client) StreamWithError(w http.ResponseWriter, r io.Reader, onErr func(provider.ErrKind, string)) error {
+	return StreamWithError(w, r, func(se *SOLOStreamError) {
+		if onErr != nil {
+			onErr(se.Kind(), se.Error())
+		}
+	})
+}
 
 func truncate(s string, n int) string {
 	s = strings.TrimSpace(s)

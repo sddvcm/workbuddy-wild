@@ -32,14 +32,14 @@ const soloErrorSSE = "data: {\"choices\":[{\"delta\":{\"content\":\"solo error c
 
 const normalSSE = "data: {\"choices\":[{\"delta\":{\"content\":\"pong\"},\"index\":0}],\"object\":\"chat.completion.chunk\"}\n\ndata: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\",\"index\":0}],\"object\":\"chat.completion.chunk\"}\n\ndata: [DONE]\n\n"
 
-func lookup(prefix string) (string, bool) {
+func lookup(prefix string) (string, bool, bool) {
 	lower := strings.ToLower(prefix)
 	for _, m := range []string{"solo error code=", "the param is invalid"} {
 		if strings.Contains(lower, m) {
-			return FirstSSEContent(prefix), true
+			return FirstSSEContent(prefix), true, false
 		}
 	}
-	return "", false
+	return "", false, false
 }
 
 // 命中：错误文案出现在正文里 → 必须被识别出来，并给出可读消息。

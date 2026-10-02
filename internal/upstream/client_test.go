@@ -31,8 +31,17 @@ func TestClassify(t *testing.T) {
 		{400, `{"code":11102,"msg":"model [Deepseek-V4.1-Flash] service info not found"}`, ErrBadModel},
 		{400, `{"code":11102,"msg":"model [Kimi-K3] service info not found"}`, ErrBadModel},
 		{400, `{"msg":"invalid model"}`, ErrBadModel},
+		// ★ D1 回归：11103「后端不支持」与 11102 同族，也是请求方参数错误。
+		// 真实响应（2026-10-02）：该模型 ID 存在，但不支持当前调用方式（如非流式）。
+		// 若不识别会落到 default → NoteError，一次错误调用让 3 个账号各 +1 errCount。
+		{400, `{"code":11103,"msg":"Backend [hunyuan-stream] is not supported"}`, ErrBadModel},
+		{400, `{"code": 11103, "msg": "Backend [x] is not supported"}`, ErrBadModel},
+		// 业务码无空格变体也要命中（上游两种序列化都可能出现）
+		{400, `{"code": 11102, "msg": "model [X] service info not found"}`, ErrBadModel},
 		// 对照：余额不足优先级更高，不能被 badModel 抢走
 		{400, `{"code":11102,"msg":"service info not found, 积分不足"}`, ErrHardCredit},
+		// 对照：11103 若同时说余额不足，仍以余额不足为准
+		{400, `{"code":11103,"msg":"not supported, 余额不足"}`, ErrHardCredit},
 		{500, `boom`, ErrServer},
 		{503, `unavailable`, ErrServer},
 		{200, ``, ErrNone},

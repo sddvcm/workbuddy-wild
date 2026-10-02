@@ -33,7 +33,7 @@ import (
 // Version 面板展示的版本号。
 // 统一入口：打包时用 -ldflags "-X github.com/rockswang/workbuddy-wild/internal/app.Version=vX.Y.Z" 注入，
 // 与 wails.json 的 productVersion、README 保持一致（升级时三处同步）。
-var Version = "0.7.2"
+var Version = "0.7.3"
 
 const (
 	loginTimeout   = 5 * time.Minute

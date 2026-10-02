@@ -12,7 +12,7 @@ set -euo pipefail
 
 BIN="build/bin"
 BACKUP="build/.bin-backup"
-WAILS="E:/data/go/bin/wails.exe"
+WAILS="C:/Users/Administrator/go/bin/wails.exe"
 
 # 1. 清理旧备份
 rm -rf "$BACKUP"

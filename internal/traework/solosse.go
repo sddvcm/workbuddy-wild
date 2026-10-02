@@ -58,10 +58,27 @@ func (e *SOLOStreamError) Error() string {
 	return fmt.Sprintf("solo error code=%d msg=%s", e.Code, e.Msg)
 }
 
-// Kind 将 SSE 流内错误分类。1005 → provider.ErrHardCredit；其余归 provider.ErrClient。
+// Kind 将 SSE 流内错误分类。
+//
+// ★ 语义修正（2026-10-02）：错误码 → 类别的映射必须与「换账号有没有用」对齐，
+// 而不是简单二分。历史实现把所有非 1005 的错都归 ErrClient，
+// 会让「模型不可用」这类**请求方错误**去累计账号 errCount（冤枉账号池）。
+//
+// 归类依据（实测）：
+//
+//	1005                                    权益/套餐不足   → ErrHardCredit（长冷却）
+//	1001 / 4001 / 400                      模型不可用/参数非法 → ErrBadModel（不冷却、不轮换）
+//	其余                                    上游故障/未知     → ErrClient
 func (e *SOLOStreamError) Kind() provider.ErrKind {
-	if e.Code == 1005 {
+	switch e.Code {
+	case 1005:
 		return provider.ErrHardCredit
+	case 1001, 4001, 400:
+		return provider.ErrBadModel
+	}
+	// 消息里明确指向参数/模型问题的也算请求方错误。
+	if k := Classify(http.StatusBadRequest, e.Msg); k == provider.ErrBadModel {
+		return provider.ErrBadModel
 	}
 	return provider.ErrClient
 }
@@ -419,15 +436,25 @@ func streamOpts(w http.ResponseWriter, r io.Reader, onErr func(*SOLOStreamError)
 				}
 				sawDone = true
 			case "error":
-				// 上游 SOLO 业务错误（1005 权益/1001 模型不可用等）：
-				// 以标准 OpenAI SSE chunk 的 delta.content 返回错误描述，
-				// finish_reason 设为 error 避免客户端持续等待。
+				// 上游 SOLO 业务错误（1005 权益不足 / 1001 模型不可用 / 4001 参数非法）。
+				//
+				// ★ 修正（2026-10-02）：**不能**把错误伪装成正常的 delta.content。
+				// 旧实现以 delta.content + finish_reason:"stop" 返回，
+				// 客户端会把它渲染成一段"模型的回答"，用户看到像答了、实则是报错，
+				// 且 finish_reason 为 stop 会掩盖失败（与"答完了"无法区分）。
+				//
+				// 现在改为 OpenAI 标准的**流内错误事件**：
+				//
+				//	event: error
+				//	data: {"error":{"message":"...","type":"...","code":"..."}}
+				//
+				// 同时仍回调 onErr（供上层冷却账号 / 记录日志），并写 [DONE] 收尾，
+				// 保证客户端不会因缺少终止事件而挂起。
 				se := &SOLOStreamError{Code: ev.ErrorCode, Msg: ev.ErrorMessage}
 				if onErr != nil {
 					onErr(se)
 				}
-				msg := fmt.Sprintf("solo error code=%d msg=%s", ev.ErrorCode, ev.ErrorMessage)
-				if err := writeChunk(map[string]any{"content": msg}, "stop"); err != nil {
+				if err := writeErrorEvent(w, se); err != nil {
 					return err
 				}
 				if err := writeDONE(); err != nil {
@@ -450,4 +477,33 @@ func streamOpts(w http.ResponseWriter, r io.Reader, onErr func(*SOLOStreamError)
 func jsonEscape(s string) string {
 	raw, _ := json.Marshal(s)
 	return string(raw)
+}
+
+// writeErrorEvent 把上游 SOLO 业务错误写成 OpenAI 标准的**流内错误事件**。
+//
+// OpenAI 流式协议里错误以 `data: {"error":{...}}` 形式下发（不占用 choices），
+// 这是各家客户端（含 chatbox / nextchat / LobeChat 等）普遍识别的形态。
+//
+// type 字段复用错误分类名（bad_model / hard_credit / ...），
+// 便于客户端按类别做差异化提示（例如"该模型不可用"vs"额度不足"）。
+func writeErrorEvent(w http.ResponseWriter, se *SOLOStreamError) error {
+	msg := se.Error()
+	if strings.TrimSpace(se.Msg) == "" {
+		msg = fmt.Sprintf("upstream error code=%d (no message)", se.Code)
+	}
+	payload := map[string]any{
+		"error": map[string]any{
+			"message": msg,
+			"type":    se.Kind().String(),
+			"code":    fmt.Sprintf("%d", se.Code),
+		},
+	}
+	raw, _ := json.Marshal(payload)
+	if _, err := io.WriteString(w, "event: error\ndata: "+string(raw)+"\n\n"); err != nil {
+		return err
+	}
+	if fl, ok := w.(http.Flusher); ok {
+		fl.Flush()
+	}
+	return nil
 }

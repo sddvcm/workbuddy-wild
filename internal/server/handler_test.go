@@ -662,3 +662,52 @@ func TestGenericClientErrorStillCooldownsAccounts(t *testing.T) {
 		t.Errorf("普通 4xx 达到阈值后应冷却账号，实际 cooling=%v reason=%q", st.Cooling, st.Reason)
 	}
 }
+
+// ★ D1 回归：11103「后端不支持」与 11102 同族，也不得拖累账号池。
+//
+// 回归背景（真实事故，2026-10-02）：某模型 ID 存在但不支持当前调用方式
+// （如非流式），上游返回
+//
+//	400 {"code":11103,"msg":"Backend [hunyuan-stream] is not supported"}
+//
+// 旧实现只按文案匹配（`service info not found` 等），`is not supported`
+// 不在其中、业务码也没判 → 落到 default 分支 → NoteError，
+// 一次调用就让 3 个账号各 +1 errCount。正确行为同 11102：
+// 不计数、不冷却、只试 1 次、以 400 明确返回。
+func TestBackendUnsupportedDoesNotCooldownAccounts(t *testing.T) {
+	var calls int
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		calls++
+		return 400, `{"code":11103,"msg":"Backend [hunyuan-stream] is not supported"}`, false
+	})
+	a1 := &auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999}
+	a2 := &auth.Auth{UID: "u2", AccessToken: "at2", ExpiresAt: 9999999999}
+	a3 := &auth.Auth{UID: "u3", AccessToken: "at3", ExpiresAt: 9999999999}
+	p := testPoolWith(a1, a2, a3)
+	h := NewHandler(Config{Pool: p, Upstream: up, MaxRotate: 3, ErrThreshold: 1, ErrCooldown: time.Hour})
+
+	req := httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"workbuddy/hunyuan-stream","messages":[{"role":"user","content":"hi"}]}`))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("后端不支持应返回 400，实际 %d body=%s", rec.Code, rec.Body.String())
+	}
+	if calls != 1 {
+		t.Errorf("应只试 1 次即停止（换号无用），实际调用上游 %d 次", calls)
+	}
+	for _, au := range []*auth.Auth{a1, a2, a3} {
+		st, ok := p.Status(au.UID)
+		if !ok {
+			t.Fatalf("账号 %s 丢失", au.UID)
+		}
+		if st.Cooling {
+			t.Errorf("账号 %s 被错误冷却（reason=%q）—— 11103 与账号无关",
+				au.UID, st.Reason)
+		}
+		if st.ErrCount != 0 {
+			t.Errorf("账号 %s errCount=%d，应为 0", au.UID, st.ErrCount)
+		}
+	}
+}

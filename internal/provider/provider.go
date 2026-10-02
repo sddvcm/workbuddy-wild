@@ -32,6 +32,7 @@ const (
 	ErrBadModel                   // 请求方参数错误（模型 ID 不存在 / 参数非法）→ 与账号无关，不冷却、不轮换
 	ErrServer                     // 5xx 上游故障
 	ErrClient                     // 其他 4xx / 业务错误
+	ErrUnknown                    // 已确认是错误但类别待定 → 交由调用方按 body 细分
 )
 
 func (k ErrKind) String() string {
@@ -50,6 +51,8 @@ func (k ErrKind) String() string {
 		return "server"
 	case ErrClient:
 		return "client"
+	case ErrUnknown:
+		return "unknown"
 	default:
 		return "none"
 	}
@@ -84,4 +87,17 @@ type Upstream interface {
 	Classify(status int, body string) ErrKind
 	Stream(w http.ResponseWriter, r io.Reader) error
 	Aggregate(r io.Reader) (map[string]any, error)
+}
+
+// StreamErrorReporter 是 Upstream 的**可选**扩展：流式转换过程中
+// 遭遇上游错误时回调出来（错误本身仍以下发 SSE 事件的方式交给客户端）。
+//
+// 为什么需要它：错误可能出现在流的**中途**，超出 ChatStream 的预读嗅探
+// 窗口。若不回调，错误只下发给客户端，服务端却已把它记为"账号成功"，
+// 于是该冷却的账号没有被冷却（权益不足会被反复重试）。
+//
+// 实现方（traework）满足此接口；workbuddy 上游是 OpenAI 原始 SSE，
+// 不做流内错误包装，因此不实现 —— handler 用类型断言按需取用。
+type StreamErrorReporter interface {
+	StreamWithError(w http.ResponseWriter, r io.Reader, onErr func(kind ErrKind, msg string)) error
 }
