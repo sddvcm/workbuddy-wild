@@ -171,6 +171,10 @@ func (h *Handler) modelList() []map[string]any {
 			if mi.MaxTokens > 0 {
 				entry["max_output_tokens"] = mi.MaxTokens
 			}
+			// 说明该 id 支持在名称后追加人类可读备注（如「（倍率0.11x）」），
+			// 备注会在发给上游前自动剥离。客户端可选择展示给用户。
+			entry["name"] = id
+			entry["annotation_supported"] = true
 			out = append(out, entry)
 		}
 	}
@@ -329,8 +333,52 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	writeOpenAIError(w, http.StatusServiceUnavailable, "no_healthy_account", msg)
 }
 
+// modelAnnotations 是允许出现在模型名之后的**备注包裹符**（成对使用）。
+//
+// 用途：让用户能在客户端里给模型写人类可读的备注，便于区分同名模型，例如
+//
+//	workbuddy/deepseek-v4-flash（倍率0.11x）
+//	workbuddy/deepseek-v4-flash (rate 0.11x)
+//	traework/glm-5.2【便宜】
+//
+// 备注内容随意填，程序在**调用上游前**会把它剥掉，
+// 因此不影响任何实际请求；模型列表里展示的是带备注的名字 +
+// 标准 id 字段（客户端可自行选择显示哪个）。
+var modelAnnotations = [][2]string{
+	{"（", "）"}, // 全角圆括号（中文输入法默认）
+	{"(", ")"}, // 半角圆括号
+	{"【", "】"}, // 全角方括号
+	{"[", "]"}, // 半角方括号
+	{"「", "」"}, // 全角引号
+}
+
+// stripModelAnnotation 去掉模型名末尾的备注部分。
+//
+// 规则：从**第一个**出现的注释起始符切起，只保留它之前的部分。
+// 这样「（倍率0.11x）」「(x)」「【便宜】(备用)」都能一次剥净。
+//
+// 若剥离后为空（例如用户只写了「（备注）」而没写模型名），
+// 则原样返回，交由上层报「模型名不合法」，避免静默变成空串。
+func stripModelAnnotation(model string) string {
+	s := strings.TrimSpace(model)
+	cut := -1
+	for _, pair := range modelAnnotations {
+		if i := strings.Index(s, pair[0]); i >= 0 {
+			if cut < 0 || i < cut {
+				cut = i
+			}
+		}
+	}
+	if cut <= 0 {
+		// cut < 0：没有备注；cut == 0：整串都是备注，保留原样让上层报错
+		return s
+	}
+	return strings.TrimSpace(s[:cut])
+}
+
 func (h *Handler) runtimeForModel(model string) (*Runtime, string, error) {
-	parts := strings.SplitN(strings.TrimSpace(model), "/", 2)
+	raw := strings.TrimSpace(model)
+	parts := strings.SplitN(raw, "/", 2)
 	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
 		return nil, "", fmt.Errorf("model must use explicit prefix: workbuddy/<model> or traework/<model>")
 	}
@@ -342,7 +390,13 @@ func (h *Handler) runtimeForModel(model string) (*Runtime, string, error) {
 	if len(rt.Pool.List()) == 0 {
 		return nil, "", fmt.Errorf("provider %q has no account", kind)
 	}
-	return rt, parts[1], nil
+	// 剥掉人类可读的备注（如「（倍率0.11x）」）——备注仅供辨认，不发给上游。
+	// 例如 workbuddy/deepseek-v4-flash（倍率0.11x） → deepseek-v4-flash
+	name := stripModelAnnotation(parts[1])
+	if name == "" {
+		return nil, "", fmt.Errorf("model name is empty after removing annotation: %q", raw)
+	}
+	return rt, name, nil
 }
 
 func rewriteModel(body []byte, model string) ([]byte, error) {

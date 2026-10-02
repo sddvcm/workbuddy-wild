@@ -11,6 +11,7 @@ import (
 
 	"github.com/rockswang/workbuddy-wild/internal/auth"
 	"github.com/rockswang/workbuddy-wild/internal/pool"
+	"github.com/rockswang/workbuddy-wild/internal/provider"
 	"github.com/rockswang/workbuddy-wild/internal/upstream"
 )
 
@@ -426,5 +427,156 @@ func TestStatusRequiresAuth(t *testing.T) {
 	h.ServeHTTP(rec, httptest.NewRequest("GET", "/healthz", nil))
 	if rec.Code != 200 {
 		t.Errorf("healthz: code=%d", rec.Code)
+	}
+}
+
+// ---- 模型名备注（annotation）支持 ----
+//
+// 需求：允许在模型名后追加人类可读的备注，便于在客户端里区分同名模型，
+// 例如 workbuddy/deepseek-v4-flash（倍率0.11x）。
+// 备注必须在下发上游前被剥离，且不影响前缀路由。
+
+func TestStripModelAnnotation(t *testing.T) {
+	cases := []struct {
+		in   string
+		want string
+	}{
+		// 需求里举的例子
+		{"deepseek-v4-flash（倍率0.11x）", "deepseek-v4-flash"},
+		// 各种括号（全角/半角/方/引号）
+		{"deepseek-v4-flash(rate 0.11x)", "deepseek-v4-flash"},
+		{"glm-5.2【便宜】", "glm-5.2"},
+		{"glm-5.2[cheap]", "glm-5.2"},
+		{"glm-5.2「备用」", "glm-5.2"},
+		// 多段备注一次剥净（取第一个起始符之前）
+		{"glm-5.2（倍率0.11x）(备用)", "glm-5.2"},
+		// 备注在中间也剥（从第一个起始符切开）
+		{"kimi-k2.7（a）extra", "kimi-k2.7"},
+		// 无备注：原样返回
+		{"deepseek-v4-flash", "deepseek-v4-flash"},
+		// 前后空白应清理
+		{"  glm-5.2  ", "glm-5.2"},
+		// 只有备注（没写模型名）：原样返回，交由上层报错，不能变空串
+		{"（倍率0.11x）", "（倍率0.11x）"},
+		// 模型名本身含连字符/点/数字，不受影响
+		{"Doubao-Seed-2.1-Pro（贵）", "Doubao-Seed-2.1-Pro"},
+		{"kimi-k2.7-code（code专用）", "kimi-k2.7-code"},
+	}
+	for _, c := range cases {
+		if got := stripModelAnnotation(c.in); got != c.want {
+			t.Errorf("stripModelAnnotation(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
+}
+
+// 端到端：带备注的模型名必须能正确路由，且**发给上游的 model 字段不含备注**。
+func TestChatCompletionsStripsModelAnnotation(t *testing.T) {
+	var gotModel string
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		// 上游收到的请求体里应当是剥离备注后的干净模型名
+		return 200, sseOK, true
+	})
+	// 用自定义 Transport 截获请求体里的 model
+	up.HTTP = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		b, _ := io.ReadAll(r.Body)
+		var obj map[string]any
+		_ = json.Unmarshal(b, &obj)
+		gotModel, _ = obj["model"].(string)
+		return &http.Response{
+			StatusCode: 200,
+			Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+			Body:       io.NopCloser(strings.NewReader(sseOK)),
+		}, nil
+	})}
+
+	h := NewHandler(Config{
+		Pool:     testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999}),
+		Upstream: up,
+	})
+	req := httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"workbuddy/deepseek-v4-flash（倍率0.11x）","messages":[{"role":"user","content":"hi"}]}`))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != 200 {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+	if gotModel != "deepseek-v4-flash" {
+		t.Fatalf("发给上游的 model = %q，备注未被剥离（want deepseek-v4-flash）", gotModel)
+	}
+}
+
+// 各种括号形式都要能被端到端剥离。
+func TestChatCompletionsAnnotationForms(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"workbuddy/glm-5.2【便宜】", "glm-5.2"},
+		{"workbuddy/glm-5.2(cheap)", "glm-5.2"},
+		{"workbuddy/kimi-k2.7「备用」", "kimi-k2.7"},
+		{"traework/glm-5.2（倍率低）", "glm-5.2"},
+	}
+	for _, c := range cases {
+		var gotModel string
+		up := newFakeUpstream(t, func(authz string) (int, string, bool) { return 200, sseOK, true })
+		up.HTTP = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			b, _ := io.ReadAll(r.Body)
+			var obj map[string]any
+			_ = json.Unmarshal(b, &obj)
+			gotModel, _ = obj["model"].(string)
+			return &http.Response{
+				StatusCode: 200,
+				Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+				Body:       io.NopCloser(strings.NewReader(sseOK)),
+			}, nil
+		})}
+		kind := provider.WorkBuddy
+		if strings.HasPrefix(c.in, "traework/") {
+			kind = provider.TraeWork
+		}
+		h := NewHandler(Config{
+			Runtimes: map[provider.Kind]*Runtime{
+				kind: {Kind: kind, Pool: testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999}), Upstream: up},
+			},
+		})
+		req := httptest.NewRequest("POST", "/v1/chat/completions",
+			strings.NewReader(`{"model":"`+c.in+`","messages":[{"role":"user","content":"hi"}]}`))
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+
+		if gotModel != c.want {
+			t.Errorf("%s -> 上游 model=%q, want %q (code=%d)", c.in, gotModel, c.want, rec.Code)
+		}
+	}
+}
+
+// 回归：不带备注的模型名照常工作（不能因为新增注释逻辑而破坏原有路径）。
+func TestChatCompletionsPlainModelStillWorks(t *testing.T) {
+	var gotModel string
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) { return 200, sseOK, true })
+	up.HTTP = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		b, _ := io.ReadAll(r.Body)
+		var obj map[string]any
+		_ = json.Unmarshal(b, &obj)
+		gotModel, _ = obj["model"].(string)
+		return &http.Response{
+			StatusCode: 200,
+			Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+			Body:       io.NopCloser(strings.NewReader(sseOK)),
+		}, nil
+	})}
+
+	h := NewHandler(Config{
+		Pool:     testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999}),
+		Upstream: up,
+	})
+	req := httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"workbuddy/glm-5.2","messages":[{"role":"user","content":"hi"}]}`))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != 200 {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+	if gotModel != "glm-5.2" {
+		t.Fatalf("model=%q, want glm-5.2", gotModel)
 	}
 }
