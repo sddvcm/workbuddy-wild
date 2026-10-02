@@ -25,6 +25,26 @@
 
 ## 更新记录
 
+### v0.7.2（2026-10-02）
+- **修复：TraeWork 的「200 伪装错误」被当成模型回答透传给客户端**
+  - **现象**：给 traework 传一个上游不存在的模型，客户端**不报错**，而是显示一段
+    `solo error code=4001 msg=We're sorry, the param is invalid...` —— 看起来像是模型答了这句话
+  - **根因**：traework 上游（`/api/agent/v3/llm_utils_chat`）在参数/模型非法时
+    **不返回 4xx**，而是返回 `200` + 一条形状完全正常的 SSE，把错误文本塞进 `content`：
+    ```json
+    data: {"choices":[{"delta":{"content":"solo error code=4001 msg=...the param is invalid"}}]}
+    ```
+    服务只按 HTTP 状态码判错，于是这行错误被原样透传
+  - **修复**：
+    1. 新增共享工具 `provider.SniffInBandError()`：预读流开头做嗅探，
+       命中错误文案则归一化成 `400` 交给 `Classify()`；
+       **未命中则用 `io.MultiReader` 把预读字节回放**，流内容一字节不丢
+       （上限 64 KB / 8 秒，超限即放行，不拖慢首字节很慢的模型）
+    2. traework `Classify()` 识别 `solo error code=` / `the param is invalid`
+       → `ErrBadModel`（请求方参数错误：**不冷却账号、不白试轮换**）
+    3. `model_not_available` 文案补充"若 id 正确则说明请求参数不被上游接受"
+  - **定性与影响**：与 v0.7.1 同类 —— 参数错误不再冤枉账号池
+
 ### v0.7.1（2026-10-02）
 - **修复：模型名写错会「冤枉」地把整个账号池冷却**
   - **用户反馈**：面板显示「冷却中（consecutive errors 至 10-02 15:38）」

@@ -339,14 +339,16 @@ rotate:
 	if lastErr != nil {
 		msg += ": " + lastErr.Error()
 	}
-	// 模型名错误：以 400 明确返回并指路，不要伪装成"账号不可用"（会让人误以为是账号问题）。
+	// 请求方参数错误（模型 ID 不存在 / 参数非法）：以 400 明确返回并指路，
+	// 不要伪装成"账号不可用"（会让人误以为是账号问题，且会冤枉冷却整个账号池）。
 	if lastErr != nil {
 		var ue *provider.Error
 		if errors.As(lastErr, &ue) && ue.Kind == provider.ErrBadModel {
 			writeOpenAIError(w, http.StatusBadRequest, "model_not_available", fmt.Sprintf(
-				"model %q is not available upstream. 上游按「模型 ID」精确匹配且区分大小写，"+
-					"请填 /v1/models 返回的 id（而不是客户端展示的名字）。上游原始响应: %s",
-				peek.Model, ue.Msg))
+				"model %q is not available upstream (http %d). 上游按「模型 ID」精确匹配且区分大小写，"+
+					"请填 /v1/models 返回的 id（而不是客户端展示的名字）；若确认 id 正确，则说明该请求参数不被上游接受。"+
+					"上游原始响应: %s",
+				peek.Model, ue.Status, ue.Msg))
 			return
 		}
 	}

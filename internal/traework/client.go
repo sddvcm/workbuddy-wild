@@ -21,9 +21,42 @@ import (
 
 var sessionDeadMarkers = []string{"login", "token 失效", "token invalid", "session", "unauthorized", "401"}
 
+// inBandErrorMarkers 是 traework **把错误塞进 HTTP 200 正文**时使用的文案片段。
+//
+// ★ 实测（2026-10-02）：给 traework 传一个上游不存在的模型 ID，
+// 上游不返回 4xx，而是返回 200 + 一条形状完全正常的 SSE：
+//
+//	data: {"choices":[{"delta":{"content":"solo error code=4001 msg=We're sorry,
+//	       the param is invalid. Please try with a valid param."},"finish_reason":"stop"}]}
+//
+// 若不识别，这行错误文本会被当成模型的回答显示给用户 —— 比报错更糟（看起来像答了）。
+//
+// 定性：这是**请求方参数错误**（模型 ID 不存在 / 参数非法），
+// 换账号、重试都无用，因此归入 provider.ErrBadModel（不冷却账号）。
+//
+// 选词刻意保守，只取足够独特的片段，避免误伤正常回答里恰好出现的词。
+var inBandErrorMarkers = []string{"solo error code=", "the param is invalid"}
+
+// inBandErrorLookup 供 provider.SniffInBandError 使用的判定函数。
+func inBandErrorLookup(prefix string) (string, bool) {
+	lower := strings.ToLower(prefix)
+	for _, m := range inBandErrorMarkers {
+		if strings.Contains(lower, strings.ToLower(m)) {
+			return provider.FirstSSEContent(prefix), true
+		}
+	}
+	return "", false
+}
+
 // Classify 按 HTTP 状态码 + body 判定错误类别。
 func Classify(status int, body string) provider.ErrKind {
 	lower := strings.ToLower(body)
+	// 正文内错误（由 SniffInBandError 归一化成 400 + 原文）优先判定。
+	for _, m := range inBandErrorMarkers {
+		if strings.Contains(lower, strings.ToLower(m)) {
+			return provider.ErrBadModel
+		}
+	}
 	if strings.Contains(body, `"code":1005`) || (strings.Contains(body, "1005") && strings.Contains(lower, "plan")) {
 		return provider.ErrHardCredit
 	}
@@ -237,7 +270,14 @@ func (c *Client) ChatStream(a *auth.Auth, body []byte) (rc io.ReadCloser, status
 		log.Printf("traework chat_stream uid=%s: upstream %d %s body=%s", a.UID, resp.StatusCode, kind, truncate(string(raw), 200))
 		return nil, resp.StatusCode, raw, nil
 	}
-	return resp.Body, resp.StatusCode, nil, nil
+	// HTTP 200 也可能是错误（见 inBandErrorMarkers）：预读开头若干字节做嗅探，
+	// 命中则归一化成 400 交给上层 Classify；未命中则原样放行，流内容不丢。
+	sniffed, msg, hit := provider.SniffInBandError(resp.Body, inBandErrorLookup, 64<<10, 8*time.Second)
+	if hit {
+		log.Printf("traework chat_stream uid=%s: upstream 200 in-band error: %s", a.UID, truncate(msg, 200))
+		return nil, http.StatusBadRequest, []byte(msg), nil
+	}
+	return sniffed, resp.StatusCode, nil, nil
 }
 
 func (c *Client) FetchModels(a *auth.Auth) ([]provider.ModelInfo, error) {

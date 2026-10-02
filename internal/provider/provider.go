@@ -29,7 +29,7 @@ const (
 	ErrSoftRate                   // 429 软限流 → 短冷却
 	ErrSessionDead                // 登录态失效 → 禁用
 	ErrNotFound                   // 404 上游偶发 → 短冷却不累计 errCount
-	ErrBadModel                   // 模型 ID 不存在 → 请求方参数错误，与账号无关，不冷却
+	ErrBadModel                   // 请求方参数错误（模型 ID 不存在 / 参数非法）→ 与账号无关，不冷却、不轮换
 	ErrServer                     // 5xx 上游故障
 	ErrClient                     // 其他 4xx / 业务错误
 )
