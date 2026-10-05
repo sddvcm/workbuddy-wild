@@ -1,0 +1,111 @@
+# WorkBuddy-Wild · 飞牛 NAS (fnOS) 图形界面部署版
+#
+# ═══════════════════════════════════════════════════════════════════
+#  使用场景：飞牛 NAS「Docker → 容器 → 新增/Compose 项目」图形界面，
+#            直接粘贴本文件内容即可部署。
+#
+#  ⚠️ 重要前提：镜像必须先存在，二选一 ——
+#
+#    【路径 A · 推荐】在 NAS 上现场构建（需要 Dockerfile + 3 个二进制）
+#      1. 把整个 docker/ 目录传到 NAS，例如：
+#           /vol1/@app/compose/workbuddy-wild/
+#              ├── Dockerfile
+#              ├── workbuddy-wild-server
+#              ├── workbuddy-login
+#              ├── workbuddy-login-trae
+#              └── entrypoint.sh, login.sh, login-trae.sh
+#      2. 用 SSH 或 fnOS 终端在该目录执行一次：
+#           docker build -t workbuddy-wild:latest .
+#      3. 之后再用本 yml 建容器（image 已存在，不会去外网拉）
+#
+#    【路径 B】把镜像导出成 tar 传上去导入
+#      在有 Docker 的机器上：
+#        docker build -t workbuddy-wild:latest .
+#        docker save workbuddy-wild:latest -o wb.tar
+#      传到 NAS 后：docker load -i wb.tar
+#
+#  ⚠️ 部署前必须改 3 处（下面都标了 ★必改）：
+#    1. WB2A_API_KEY    改成你自己的强随机密钥
+#    2. volumes 左侧的宿主机路径，改成你 NAS 上真实存在的目录
+#    3. 如果 7863 端口被占用，改 ports 左侧
+# ═══════════════════════════════════════════════════════════════════
+
+services:
+  workbuddy-wild:
+    # ── 镜像 ─────────────────────────────────────────────────────
+    # 用上面「路径 A/B」准备好的本地镜像
+    image: workbuddy-wild:latest
+
+    # 备选：如果你希望 compose 自己构建（等价于路径 A，但 compose 代劳），
+    # 取消下面两行注释，并把上面的 image 保留（构建产物会用这个 tag）
+    # build:
+    #   context: /vol1/@app/compose/workbuddy-wild
+    #   dockerfile: Dockerfile
+
+    container_name: workbuddy-wild
+    # 容器异常退出自动重启；手动 stop 后不会自己起来
+    restart: unless-stopped
+
+    environment:
+      # 容器内必须监听全部网卡（不能写 127.0.0.1，否则宿主访问不到）
+      WB2A_LISTEN: ":7863"
+
+      # ★必改 强随机 API 密钥（OpenAI 兼容接口的 Bearer 鉴权）
+      #   生成方法：head -c 24 /dev/urandom | base64 | tr -d '/+='
+      #   注意：留空 = 接口完全无鉴权，任何人可消耗你的账号额度
+      WB2A_API_KEY: "CHANGE_ME_strong_api_key"
+
+      # 账号目录与状态文件（容器内路径，对应下面 volumes 的挂载点）
+      WB2A_AUTH_DIR: "/data/auths"
+      WB2A_STATE_FILE: "/data/state.json"
+
+      # 区域：cn = 国内 CodeBuddy（国际版填 global）
+      WB2A_REGION: "cn"
+
+      # 选号策略：credits 优先积分最高 / expire 优先即将过期 / roundrobin 负载均衡
+      WB2A_STRATEGY: "credits"
+
+      # 单请求最多尝试几个账号（失败后轮换下一个）
+      WB2A_MAX_ROTATE: "3"
+
+      # ── 以下为可选参数，按需取消注释 ──────────────────────────
+      # 冷却时长
+      # WB2A_HARD_CREDIT: "12h"        # 余额/权益不足
+      # WB2A_SOFT_RATE: "60s"          # 被限流
+      # WB2A_ERR_THRESHOLD: "3"        # 累计错误几次进入冷却
+      # WB2A_ERR_COOLDOWN: "10m"       # 错误冷却时长
+      # 上游超时
+      # WB2A_TIMEOUT_SECONDS: "120"
+
+      # 时区（影响定时签到的触发时刻，务必设对）
+      TZ: "Asia/Shanghai"
+
+    ports:
+      # 格式「宿主机端口:容器端口」，容器端口固定 7863 不要改
+      # 左侧 7863 若被占用可改成比如 17863，之后访问也用新端口
+      - "7863:7863"
+
+    volumes:
+      # ★必改 把 /vol1/appdata/workbuddy-wild 改成你 NAS 上真实的持久化目录
+      #   fnOS 惯例：应用数据放 /vol1/appdata/<应用名>/
+      #   首次启动会自动创建 auths/ 与 state-*.json，无需手动建文件
+      #   ⚠️ 只挂「目录」，绝不挂单个文件（旧版挂 config.json 单文件导致容器崩溃）
+      - /vol1/appdata/workbuddy-wild:/data
+
+    healthcheck:
+      # 探针打容器内网卡，不带 API Key（/healthz 无需鉴权）
+      test: ["CMD", "wget", "-q", "-O", "-", "http://127.0.0.1:7863/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+    # 日志轮转：防止长期运行把 NAS 磁盘写满
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+    # 让容器内以非 root 运行更安全（如启用了下面的 user，需同步 chown 数据目录）
+    # user: "1000:1000"

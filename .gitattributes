@@ -1,0 +1,8 @@
+# shell 脚本必须保持 LF，否则 Linux/NAS 上会报
+#   /bin/sh^M: bad interpreter: No such file or directory
+*.sh text eol=lf
+docker/*.sh text eol=lf
+
+# Dockerfile 同理（虽然多行续行不受影响，但保持一致）
+Dockerfile text eol=lf
+docker/Dockerfile text eol=lf

@@ -27,7 +27,9 @@
 ```
 docker/
 ├── Dockerfile              # 极简 alpine，只 COPY 预编译二进制
-├── docker-compose.yml      # fnOS compose 部署
+├── docker-compose.yml      # 命令行版（在 docker/ 目录内 docker compose up -d --build）
+├── fnos-compose.yml        # ★ 飞牛图形界面版（粘贴到「Docker → Compose」）
+├── build-on-nas.sh         # ★ 在 NAS 上构建镜像的一键脚本
 ├── entrypoint.sh           # 建数据目录 + 由环境变量生成 config.json 并启动
 ├── login.sh                # WorkBuddy 登录助手
 ├── login-trae.sh           # TraeWork 登录助手（需 TRAE_DEVICE_ID）
@@ -40,49 +42,73 @@ docker/
 
 > 三个二进制均在开发机用 **Go 1.26.7** 交叉编译为 `linux/amd64`、`CGO_ENABLED=0` 静态二进制，可直接在任意 x86_64 Linux（含飞牛 NAS）运行。
 
+### 两个 compose 文件怎么选
+
+| | `docker-compose.yml` | `fnos-compose.yml` |
+|---|---|---|
+| 适用 | SSH / 终端操作 | 飞牛「Docker → Compose」图形界面 |
+| 镜像 | `build:` 现场构建 | `image:` 用已有镜像 |
+| 挂载 | 相对路径 `./data` | 绝对路径 `/vol1/appdata/...` |
+| 额外 | — | 日志轮转（防写满磁盘） |
+
 ---
 
 ## 三、部署步骤
 
-1. 把 `docker/` 整个目录传到 NAS（fnOS「文件」里建目录，如 `/vol1/@app/compose/workbuddy-wild/`；或 SSH `scp`）。
+### 3.1 先把镜像准备好（二选一）
 
-2. 进入该目录：
-   ```bash
-   cd /vol1/@app/compose/workbuddy-wild
-   ```
+**路径 A · 在 NAS 上构建**（推荐）：
 
-3. **改密钥**：把 `.env.example` 复制为 `.env`，设置强随机 API Key：
-   ```bash
-   cp .env.example .env
-   echo "WB2A_API_KEY=$(head -c 24 /dev/urandom | base64 | tr -d '/+=')" > .env
-   ```
-   （也可以直接改 `docker-compose.yml` 里的 `WB2A_API_KEY` 默认值）
+```bash
+# 把整个 docker/ 目录传到 NAS，比如 /vol1/@app/compose/workbuddy-wild/
+cd /vol1/@app/compose/workbuddy-wild
+sh build-on-nas.sh          # 检查文件 + 构建 workbuddy-wild:latest
+```
 
-4. 启动：
-   ```bash
-   docker compose up -d --build
-   ```
+**路径 B · 从别处导出镜像**（本机没有 Docker 也能用在线构建机）：
 
-5. 看日志：
-   ```bash
-   docker compose logs -f workbuddy-wild
-   ```
-   正常输出类似：
-   ```
-   [entrypoint] generated /app/config.json  listen=:7863  region=cn  api_key_set=yes
-   config: listen=:7863 auth_dir=/data/auths ... strategy=credits max_rotate=3
-   loaded accounts: workbuddy=0 cn, traework=0 from /data/auths
-   ⚠️  没有任何账号：请先用 docker/login.sh 登录 ...
-   workbuddy-wild listening on :7863 (api_key=true)
-   ```
-   > 首次启动必然提示「没有任何账号」——正常，下一步去登录。
+```bash
+# 在有 Docker 的机器上
+docker build -t workbuddy-wild:latest .
+docker save workbuddy-wild:latest -o wb.tar
+# 传到 NAS 后
+docker load -i wb.tar
+```
 
-6. 健康检查：
-   ```bash
-   curl http://127.0.0.1:7863/healthz      # 返回 ok
-   ```
+### 3.2 启动
 
-> fnOS 图形界面：在「Docker → Compose」新建项目，把 `docker-compose.yml` 内容贴进去，「环境变量」里设好 `WB2A_API_KEY`，启动。
+**图形界面**：飞牛「Docker → 容器 → 新增 → Compose 项目」，把 `fnos-compose.yml` 内容粘贴进去，
+改好 `WB2A_API_KEY` 与卷路径后启动。
+
+**命令行**：
+
+```bash
+cd /vol1/@app/compose/workbuddy-wild
+docker compose -f fnos-compose.yml up -d
+```
+
+### 3.3 验证
+
+```bash
+docker compose -f fnos-compose.yml logs -f workbuddy-wild
+```
+正常输出类似：
+```
+[entrypoint] generated /app/config.json
+[entrypoint]   listen=:7863  region=cn  strategy=credits  max_rotate=3
+[entrypoint]   auth_dir=/data/auths
+[entrypoint]   api_key=<set>
+config: listen=:7863 auth_dir=/data/auths ... strategy=credits max_rotate=3
+loaded accounts: workbuddy=0 cn, traework=0 from /data/auths
+⚠️  没有任何账号：请先用 docker/login.sh 登录 ...
+workbuddy-wild listening on :7863 (api_key=true)
+```
+> 首次启动必然提示「没有任何账号」——正常，下一步去登录。
+
+健康检查：
+```bash
+curl http://127.0.0.1:7863/healthz      # 返回 ok
+```
 
 ---
 
@@ -96,6 +122,10 @@ Linux 侧 `secure_other.go` 遇到 `dpapi:` 前缀会返回**空串**（并在�
 而不是拿密文去请求上游 —— 这是刻意设计，避免产生一堆难懂的 401。
 
 **所以跨平台迁移账号的唯一可靠方式是在目标平台重新登录。** 见下。
+
+> 本节命令默认读 `docker-compose.yml`。若你用 `fnos-compose.yml` 部署，
+> 每条命令都加 `-f fnos-compose.yml`，例如
+> `docker compose -f fnos-compose.yml run --rm workbuddy-wild /app/login.sh`。
 
 ---
 
@@ -241,10 +271,13 @@ workbuddy/deepseek-v4-flash
    GOOS=linux GOARCH=amd64 CGO_ENABLED=0 "$GOROOT/bin/go.exe" build -o docker/workbuddy-login ./cmd/login
    GOOS=linux GOARCH=amd64 CGO_ENABLED=0 "$GOROOT/bin/go.exe" build -o docker/workbuddy-login-trae ./cmd/login_trae
    ```
-2. 把新的三个二进制传到 NAS 覆盖对应文件
-3. ```bash
-   docker compose up -d --build
+2. 把新二进制传到 NAS 覆盖对应文件
+3. 重新构建镜像并重启：
+   ```bash
+   sh build-on-nas.sh                              # 或 docker build -t workbuddy-wild:latest .
+   docker compose up -d                            # 用 fnos-compose.yml 则加 -f fnos-compose.yml
    ```
+   > 用 `fnos-compose.yml`（`image:` 模式）时，光覆盖二进制不生效 —— 必须先重建镜像。
 
 `./data` 卷里的账号与状态不受影响，无需重新登录。
 
