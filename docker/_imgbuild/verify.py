@@ -206,6 +206,25 @@ with tarfile.open(TAR, "r") as tf:
             if magic == b"\x7fELF" and perm == "0o755":
                 good("%s ELF 且 0o755" % b)
 
+        # 管理面板资源是否已内嵌进二进制（搜特征字符串）
+        print("")
+        print("[10] 管理面板资源内嵌检查")
+        srv = read_inner("app/workbuddy-wild-server")
+        for needle, label in [
+            (b"workbuddy-wild", "面板 HTML 标题"),
+            (b"/admin/", "面板路由路径"),
+            (b"window.__CSRF__", "面板 CSRF 注入点"),
+            (b"/admin/style.css", "面板样式表引用"),
+            (b"/admin/favicon.svg", "面板图标引用"),
+            (b"X-Admin-Token", "面板鉴权头"),
+            (b"/login/workbuddy/start", "WorkBuddy 登录接口"),
+            (b"/login/traework/start", "TraeWork 登录接口"),
+        ]:
+            if needle in srv:
+                good("内嵌 " + label)
+            else:
+                fail("二进制里找不到 " + label + " (" + needle.decode() + ")")
+
 print("")
 print("=" * 68)
 if ok:

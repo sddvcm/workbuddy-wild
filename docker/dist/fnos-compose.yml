@@ -68,6 +68,10 @@ services:
       # 选号策略：credits 优先积分最高 / expire 优先即将过期 / roundrobin 负载均衡
       WB2A_STRATEGY: "credits"
 
+      # 网页管理面板开关（默认开启）。浏览器打开 http://<NAS_IP>:7863/admin/
+      # 即可登录/增删账号，无需进 NAS 终端。填 off 可关闭。
+      WB2A_ADMIN: "on"
+
       # 单请求最多尝试几个账号（失败后轮换下一个）
       WB2A_MAX_ROTATE: "3"
 

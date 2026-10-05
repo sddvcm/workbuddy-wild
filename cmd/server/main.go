@@ -19,6 +19,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/rockswang/workbuddy-wild/internal/admin"
 	"github.com/rockswang/workbuddy-wild/internal/auth"
 	"github.com/rockswang/workbuddy-wild/internal/config"
 	"github.com/rockswang/workbuddy-wild/internal/pool"
@@ -113,6 +114,28 @@ func main() {
 		ErrThreshold: cfg.Cooldown.ErrThresh,
 		ErrCooldown:  cfg.ErrCooldownDur,
 	})
+
+	// ── 网页管理面板（/admin/）────────────────────────────────────────
+	// 面板与 OpenAI 接口同端口，可直接在浏览器里登录/增删账号，免进 NAS 终端。
+	// 可用 WB2A_ADMIN=off 关闭；鉴权默认复用 API_KEY。
+	if cfg.AdminEnabled {
+		adminH := admin.New(admin.Config{
+			AuthDir: cfg.AuthDir,
+			Region:  cfg.Region,
+			Pools: map[provider.Kind]*pool.Pool{
+				provider.WorkBuddy: wbPool,
+				provider.TraeWork:  trPool,
+			},
+			Token: cfg.APIKey,
+		})
+		adminH.Register(h.Mux())
+		log.Printf("管理面板已启用：http://<NAS_IP>%s/admin/  （鉴权=%v）", cfg.Listen.Addr(), cfg.APIKey != "")
+		if cfg.APIKey == "" {
+			log.Printf("⚠️  API_KEY 为空：管理面板无鉴权！任何人都能增删账号，切勿暴露公网")
+		}
+	} else {
+		log.Printf("管理面板已关闭（WB2A_ADMIN=off）")
+	}
 
 	// ── 启动 ─────────────────────────────────────────────────────────
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)

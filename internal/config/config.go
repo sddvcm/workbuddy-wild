@@ -94,6 +94,10 @@ type Config struct {
 	StateFile string `json:"state_file"` // ./data/state.json
 	Region    string `json:"region"`     // 只收 "cn"
 
+	// AdminEnabled 是否启用网页管理面板（/admin/）。默认 true；
+	// 可用 WB2A_ADMIN=off/0/false 关闭。
+	AdminEnabled bool `json:"admin_enabled"`
+
 	// Strategy 账号挑选策略：credits（优先积分）/ expire（优先过期）/ roundrobin（负载均衡）。
 	Strategy string `json:"strategy"`
 	// MaxRotate 单个请求最多尝试的账号数（失败后轮换下一个）。
@@ -130,6 +134,10 @@ func Default() *Config {
 		AuthDir:   "./auths",
 		StateFile: "./data/state.json",
 		Region:    "cn",
+
+		// AdminEnabled 默认开启网页管理面板（/admin/）。
+		AdminEnabled: true,
+
 		Strategy:  "credits",
 		MaxRotate: 3,
 	}
@@ -248,6 +256,15 @@ func applyEnv(c *Config) {
 	}
 	if v := os.Getenv("WB2A_REGION"); v != "" {
 		c.Region = v
+	}
+	// WB2A_ADMIN：管理面板开关。off/0/false/no 关闭，其余（含空）视为开启。
+	if v := strings.ToLower(strings.TrimSpace(os.Getenv("WB2A_ADMIN"))); v != "" {
+		switch v {
+		case "off", "0", "false", "no", "disable", "disabled":
+			c.AdminEnabled = false
+		default:
+			c.AdminEnabled = true
+		}
 	}
 	if v := os.Getenv("WB2A_STRATEGY"); v != "" {
 		c.Strategy = v

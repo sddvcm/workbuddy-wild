@@ -89,6 +89,9 @@ func NewHandler(cfg Config) *Handler {
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) { h.mux.ServeHTTP(w, r) }
 
+// Mux 暴露底层路由表，供外部（如管理面板）挂载额外路由。
+func (h *Handler) Mux() *http.ServeMux { return h.mux }
+
 func (h *Handler) withAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if key := h.currentAPIKey(); key != "" {

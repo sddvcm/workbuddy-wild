@@ -1,0 +1,159 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>workbuddy-wild · 账号管理</title>
+<link rel="icon" href="/admin/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/admin/style.css">
+</head>
+<body>
+<div id="app">
+
+  <header class="topbar">
+    <div class="brand">
+      <span class="logo">WB</span>
+      <div>
+        <h1>workbuddy-wild</h1>
+        <p class="sub">账号管理面板</p>
+      </div>
+    </div>
+    <div class="topbar-right">
+      <span id="status-dot" class="dot" title="连接状态"></span>
+      <button id="btn-refresh" class="btn btn-ghost">刷新</button>
+    </div>
+  </header>
+
+  <!-- 鉴权区（API_KEY 非空时显示） -->
+  <section id="authbox" class="card hidden">
+    <h2>身份验证</h2>
+    <p class="hint">面板已启用鉴权，请填入与 <code>WB2A_API_KEY</code> 相同的密钥。仅保存在本机浏览器。</p>
+    <div class="row">
+      <input id="token" type="password" placeholder="请输入 API Key" autocomplete="off">
+      <button id="btn-token" class="btn btn-primary">保存并连接</button>
+    </div>
+    <p id="auth-msg" class="msg"></p>
+  </section>
+
+  <div id="main" class="hidden">
+
+    <!-- 概览 -->
+    <section class="stats">
+      <div class="stat">
+        <span class="stat-num" id="n-wb">0</span>
+        <span class="stat-label">WorkBuddy 账号</span>
+      </div>
+      <div class="stat">
+        <span class="stat-num" id="n-tr">0</span>
+        <span class="stat-label">TraeWork 账号</span>
+      </div>
+      <div class="stat">
+        <span class="stat-num" id="n-healthy">0</span>
+        <span class="stat-label">当前可用</span>
+      </div>
+      <div class="stat">
+        <span class="stat-num" id="n-credits">0</span>
+        <span class="stat-label">积分合计</span>
+      </div>
+    </section>
+
+    <!-- 添加账号 -->
+    <section class="card">
+      <h2>添加账号</h2>
+      <div class="tabs">
+        <button class="tab active" data-tab="wb">WorkBuddy</button>
+        <button class="tab" data-tab="tr">TraeWork</button>
+      </div>
+
+      <!-- WorkBuddy 面板 -->
+      <div id="tab-wb" class="tabpane">
+        <p class="hint">点「获取授权链接」→ 在新标签页完成登录 → 回到这里点「我已登录完成」。</p>
+        <div class="row">
+          <button id="wb-start" class="btn btn-primary">获取授权链接</button>
+        </div>
+        <div id="wb-step2" class="steps hidden">
+          <ol>
+            <li>点击下面的链接打开登录页（若被拦截请手动复制到浏览器）：</li>
+          </ol>
+          <div class="linkbox">
+            <a id="wb-link" href="#" target="_blank" rel="noopener">（等待生成…）</a>
+            <button id="wb-copy" class="btn btn-mini">复制</button>
+          </div>
+          <div class="row">
+            <button id="wb-poll" class="btn btn-success">我已登录完成</button>
+            <span id="wb-msg" class="msg"></span>
+          </div>
+        </div>
+      </div>
+
+      <!-- TraeWork 面板 -->
+      <div id="tab-tr" class="tabpane hidden">
+        <p class="hint">TraeWork 需填 <b>16 位设备号</b>（不填会随机生成，签到可能返回 9074）。</p>
+        <details class="howto">
+          <summary>设备号怎么取？</summary>
+          <ol>
+            <li>在<b>装过 Trae 客户端的 Windows 电脑</b>上打开目录：<br>
+              <code>%APPDATA%\TRAE SOLO CN\User\globalStorage\</code></li>
+            <li>用记事本打开 <code>storage.json</code>，搜索 <code>iCubeAuthInfo://icube-dc:</code></li>
+            <li>冒号后面那串 16 位数字就是设备号，例如 <code>4484256452647802</code></li>
+          </ol>
+        </details>
+        <div class="row">
+          <input id="tr-device" type="text" placeholder="16 位设备号（可选）" autocomplete="off">
+          <button id="tr-start" class="btn btn-primary">获取授权链接</button>
+        </div>
+        <div id="tr-step2" class="steps hidden">
+          <ol>
+            <li>点击下面的链接完成 Trae 登录：</li>
+          </ol>
+          <div class="linkbox">
+            <a id="tr-link" href="#" target="_blank" rel="noopener">（等待生成…）</a>
+            <button id="tr-copy" class="btn btn-mini">复制</button>
+          </div>
+          <ol start="2">
+            <li>登录后浏览器会跳到一个<b>打不开的页面</b>（回调地址是容器内的 127.0.0.1，属正常）。</li>
+            <li>把地址栏里的<b>完整 URL 整段复制</b>，粘贴到下面：</li>
+          </ol>
+          <textarea id="tr-callback" rows="3" placeholder="http://127.0.0.1:18080/authorize?isRedirect=true&..."></textarea>
+          <div class="row">
+            <button id="tr-poll" class="btn btn-success">提交完成登录</button>
+            <span id="tr-msg" class="msg"></span>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- 账号列表 -->
+    <section class="card">
+      <div class="card-head">
+        <h2>账号列表</h2>
+        <div class="row">
+          <button id="btn-reload" class="btn btn-ghost">重新加载账号</button>
+        </div>
+      </div>
+      <p class="hint" id="list-hint"></p>
+      <div id="accounts"></div>
+    </section>
+
+    <!-- 使用说明 -->
+    <section class="card">
+      <h2>如何对接</h2>
+      <table class="kv">
+        <tr><th>Base URL</th><td><code id="base-url">—</code> <button class="btn btn-mini" data-copy="base-url">复制</button></td></tr>
+        <tr><th>API Key</th><td>你设置的 <code>WB2A_API_KEY</code></td></tr>
+        <tr><th>模型列表</th><td><code id="models-url">—</code></td></tr>
+      </table>
+    </section>
+
+  </div>
+
+  <div id="toast" class="toast hidden"></div>
+</div>
+
+<script>
+  window.__CSRF__ = "__WB2A_CSRF_TOKEN__";
+  window.__AUTH_REQ__ = __WB2A_AUTH_REQUIRED__;
+</script>
+<script src="/admin/app.js"></script>
+</body>
+</html>
