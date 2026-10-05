@@ -1,172 +1,276 @@
 # WorkBuddy-Wild · 飞牛 NAS (fnOS) Docker 部署
 
-把 WorkBuddy-Wild 的**无头服务端**（`cmd/server`，OpenAI 兼容 API 代理：自动签到 / 保活 / 多账号轮询 / `/v1/chat/completions`）用 Docker Compose 部署到飞牛 NAS。
+把 WorkBuddy-Wild 的**无头服务端**用 Docker Compose 部署到飞牛 NAS，得到一个 OpenAI 兼容 API 网关：
+多账号轮询 / 自动签到 / 保活 / 按模型前缀双平台路由（workbuddy + traework）。
 
-> 部署的是**服务端**，不是桌面 GUI。桌面端是 Windows 程序，不能进容器；容器里跑的是同一个仓库里的 `cmd/server` 无头模式。
-
----
-
-## 一、之前为什么总是部署失败（经验教训）
-
-| # | 旧版失败现象 | 根因 | 本次根治方案 |
-|---|--------------|------|--------------|
-| 1 | 多阶段 Dockerfile 在容器内 `go mod download` 拉 `proxy.golang.org` → `i/o timeout`，镜像永远构建不出 | NAS 构建环境访问不到 Go 官方代理 | **开发机预编译**静态 `linux/amd64` 二进制，镜像只做 `COPY`。NAS 端零 Go 工具链、零模块下载、**完全不依赖 GOPROXY** |
-| 2 | 容器一启动就 `Exited`（日志里镜像 Built 但 `Exited: 0`） | compose 里 `./config.json:/app/config.json` 把**单文件**挂载成了**空目录**；程序以目录当 JSON 解析失败 → `log.Fatalf` 退出 | **由 entrypoint 用 `WB2A_*` 环境变量在容器内生成 `/app/config.json`**，二进制读取该文件。config.json **永不 bind 挂载**，彻底杜绝“挂载成目录”崩溃；账号/状态只挂载**目录** `./data:/data` |
-| 3 | 并发构建时 `GOMODCACHE` 锁死 | 多版本 Go 共用缓存 | 预编译一次，镜像构建不再跑 `go build` |
-
-**额外新发现的坑（与部署无直接关系，但很关键）：**
-- v0.3.0 桌面端给凭据加了 **Windows DPAPI 加密**。Linux/NAS **无法解密 DPAPI**，且若加密代码无 `//go:build windows` 约束还会导致 Linux 编译失败。
-- 当前服务端 checkout（master）是**明文** auth（无 DPAPI），因此账号文件**跨平台通用**：可直接把 Windows 桌面端的 `workbuddy-*.json` 复制进 NAS 的 `auths/` 卷。
-- 若以后桌面端重引入 DPAPI，必须：① 用 `//go:build windows` 隔离；② NAS 端账号保持明文。
+> 部署的是**服务端**（`cmd/server` 无头模式），不是桌面 GUI。桌面端是 Windows 程序，不能进容器。
 
 ---
 
-## 二、文件清单（整个 `docker/` 目录传到 NAS 即可）
+## 一、这个版本修了什么（演进史）
+
+| # | 旧版现象 | 根因 | 现状 |
+|---|----------|------|------|
+| 1 | 镜像永远构建不出，`go mod download` 报 `i/o timeout` | NAS 构建环境访问不到 `proxy.golang.org` | **开发机预编译**静态 `linux/amd64` 二进制，镜像只做 `COPY`。NAS 端零 Go 工具链 |
+| 2 | 容器一启动就 `Exited: 0` | compose 把 `./config.json` **单文件**挂载成了**空目录**，程序解析 JSON 失败 → `log.Fatalf` | 由 entrypoint 用 `WB2A_*` 环境变量在容器内生成 `/app/config.json`，**永不 bind 挂载**；只挂目录 `./data:/data` |
+| 3 | **`traework/*` 模型全部 404** | `cmd/server` 停留在单平台版本（只 `LoadDir` workbuddy），而桌面端 `main.go` 早已是双平台 | ✅ **已修**：`cmd/server` 重构为双平台（两个 pool + 两个 scheduler + `Runtimes` 路由） |
+| 4 | **账号文件拷过去全部失效** | Windows 桌面端用 **DPAPI 加密** token（`dpapi:` 前缀），密钥绑定 Windows 用户；Linux 无法解密，只能返回空串 | ✅ 本版策略：**在 NAS 上重新登录**（见第四节）。这是设计使然，不是 bug |
+| 5 | traework 无法在容器内登录 | ① 无登录入口 ② 登录依赖 `127.0.0.1` 本地回调 ③ 签到设备号从 Windows 客户端读 | ✅ **已修**：新增 `login-trae.sh`（两段式手工回调）+ `--device-id` 参数 |
+| 6 | traework 签到恒返 `9074` | 设备号是随机的，服务端按「注册指纹」校验 | ✅ 用 `TRAE_DEVICE_ID` 传入客户端真实设备号（见第四节 B） |
+
+---
+
+## 二、文件清单
+
+把整个 `docker/` 目录传到 NAS：
 
 ```
 docker/
 ├── Dockerfile              # 极简 alpine，只 COPY 预编译二进制
 ├── docker-compose.yml      # fnOS compose 部署
-├── entrypoint.sh           # 建数据目录 + 由环境变量启动
-├── login.sh                # 交互式登录助手（可选）
-├── workbuddy-wild-server   # 预编译 linux/amd64 静态二进制（服务端）
-├── workbuddy-login         # 预编译 linux/amd64 静态二进制（登录助手）
+├── entrypoint.sh           # 建数据目录 + 由环境变量生成 config.json 并启动
+├── login.sh                # WorkBuddy 登录助手
+├── login-trae.sh           # TraeWork 登录助手（需 TRAE_DEVICE_ID）
+├── workbuddy-wild-server   # 预编译 linux/amd64（服务端，双平台）
+├── workbuddy-login         # 预编译 linux/amd64（WorkBuddy 登录助手）
+├── workbuddy-login-trae    # 预编译 linux/amd64（TraeWork 登录助手）
 ├── .env.example            # 环境变量模板（可选）
-└── auth.example.json       # 账号文件模板
+└── auth.example.json       # 账号文件格式参考
 ```
 
-> `workbuddy-wild-server` / `workbuddy-login` 已在开发机用 Go 1.26.7 交叉编译为 `linux/amd64`、`CGO_ENABLED=0` 静态二进制，可在任意 x86_64 Linux（含飞牛 NAS）直接运行。
+> 三个二进制均在开发机用 **Go 1.26.7** 交叉编译为 `linux/amd64`、`CGO_ENABLED=0` 静态二进制，可直接在任意 x86_64 Linux（含飞牛 NAS）运行。
 
 ---
 
-## 三、飞牛 NAS 部署步骤
+## 三、部署步骤
 
-1. 把本 `docker/` 目录整体传到 NAS（fnOS 的「文件」里建个目录，如 `/vol1/@app/compose/workbuddy-wild/`，把文件传进去；或用 SSH `scp`）。
-2. （可选）SSH 进 NAS，或从 fnOS「终端」进入该目录：
+1. 把 `docker/` 整个目录传到 NAS（fnOS「文件」里建目录，如 `/vol1/@app/compose/workbuddy-wild/`；或 SSH `scp`）。
+
+2. 进入该目录：
    ```bash
    cd /vol1/@app/compose/workbuddy-wild
    ```
-3. **改密钥**：编辑 `docker-compose.yml`，把 `WB2A_API_KEY: "CHANGE_ME_strong_api_key"` 换成强随机值（这是接口 Bearer 鉴权密钥）。
+
+3. **改密钥**：把 `.env.example` 复制为 `.env`，设置强随机 API Key：
+   ```bash
+   cp .env.example .env
+   echo "WB2A_API_KEY=$(head -c 24 /dev/urandom | base64 | tr -d '/+=')" > .env
+   ```
+   （也可以直接改 `docker-compose.yml` 里的 `WB2A_API_KEY` 默认值）
+
 4. 启动：
    ```bash
    docker compose up -d --build
    ```
-   首次会从 `Dockerfile` 构建镜像（只复制二进制，几秒完成），随后容器常驻。
-5. 看日志确认没崩：
+
+5. 看日志：
    ```bash
    docker compose logs -f workbuddy-wild
    ```
-   正常会看到：`workbuddy-wild listening on :7863 (api_key=true)`。
+   正常输出类似：
+   ```
+   [entrypoint] generated /app/config.json  listen=:7863  region=cn  api_key_set=yes
+   config: listen=:7863 auth_dir=/data/auths ... strategy=credits max_rotate=3
+   loaded accounts: workbuddy=0 cn, traework=0 from /data/auths
+   ⚠️  没有任何账号：请先用 docker/login.sh 登录 ...
+   workbuddy-wild listening on :7863 (api_key=true)
+   ```
+   > 首次启动必然提示「没有任何账号」——正常，下一步去登录。
+
 6. 健康检查：
    ```bash
-   curl http://127.0.0.1:7863/healthz   # 返回 ok
+   curl http://127.0.0.1:7863/healthz      # 返回 ok
    ```
 
-> fnOS 图形界面部署：在「Docker → Compose」新建项目，把 `docker-compose.yml` 内容贴进去（或上传目录），「环境变量」里把 `WB2A_API_KEY` 设好，启动即可。
+> fnOS 图形界面：在「Docker → Compose」新建项目，把 `docker-compose.yml` 内容贴进去，「环境变量」里设好 `WB2A_API_KEY`，启动。
 
 ---
 
-## 四、添加账号（二选一）
+## 四、添加账号（★ 必须在 NAS 上重新登录）
 
-服务端本身**没有**账号管理网页，账号以 JSON 文件形式放在 `auths/` 目录（卷已挂到 `./data/auths`）。
+### 为什么不能直接拷 Windows 的 auth 文件
 
-### 方法 A（推荐，最稳）：复制桌面端账号文件
-Windows 桌面端会把账号存为 `workbuddy-*.json`（明文）。找到这些文件，直接复制进 NAS 的 `./data/auths/` 目录，文件名保持 `workbuddy-<uid>.json` 即可。重启容器加载：
-```bash
-docker compose restart workbuddy-wild
-```
+Windows 桌面端把 token 加密成 `dpapi:...` 密文（`internal/auth/secure_windows.go`）。
+DPAPI 密钥绑定「当前 Windows 用户」，**换机器/换用户都解不开**。
+Linux 侧 `secure_other.go` 遇到 `dpapi:` 前缀会返回**空串**（并在日志告警），
+而不是拿密文去请求上游 —— 这是刻意设计，避免产生一堆难懂的 401。
 
-### 方法 B（高级）：用登录助手现场登录
-在 NAS 上交互式完成 OAuth（必须在**同一次容器会话**内走完 url→浏览器登录→poll）：
+**所以跨平台迁移账号的唯一可靠方式是在目标平台重新登录。** 见下。
+
+---
+
+### A. WorkBuddy 账号
+
 ```bash
 docker compose run --rm workbuddy-wild /app/login.sh
 ```
-按提示在浏览器打开授权 URL、登录，回车后自动把 token 转成 auth 文件写入 `./data/auths/`。
 
-> 字段格式（手动新建 `workbuddy-<uid>.json` 时参考 `auth.example.json`）：
-> 嵌套形 `{ "auth": {accessToken, refreshToken, expiresAt, domain, ...}, "account": {uid, ...} }` 或扁平形 `{accessToken, uid, ...}` 都支持。
-> `domain` 留空 = 国内账号（cn）；含 `workbuddy.ai` = 国际账号（global），需与 `WB2A_REGION` 对应。
+按提示：
+1. 脚本打印一个授权 URL → 在你电脑浏览器打开、登录 CodeBuddy
+2. 回到终端按回车 → 脚本自动轮询、换 token、写入 `./data/auths/workbuddy-<uid>.json`
+
+> 必须在**同一次 `docker compose run` 会话**内完成（state 文件在容器 `/tmp`）。
 
 ---
 
-## 五、对接与使用
+### B. TraeWork 账号（★ 需要设备号）
+
+```bash
+docker compose run --rm \
+  -e TRAE_DEVICE_ID=4484256452647802 \
+  workbuddy-wild /app/login-trae.sh
+```
+
+**设备号怎么取**（不做这步，签到会一直返回 `9074`）：
+
+1. 在**装过 Trae 客户端的 Windows 电脑**上，打开目录：
+   ```
+   %APPDATA%\TRAE SOLO CN\User\globalStorage\
+   ```
+   （也可能是 `Trae CN` / `Trae` / `TraeWork`，哪个存在用哪个）
+2. 用记事本打开 `storage.json`，搜索：`iCubeAuthInfo://icube-dc:`
+3. 冒号后面那串 **16 位数字**就是设备号，例如 `4484256452647802`
+
+**登录流程**（两段式，因为容器里的 `127.0.0.1` 你访问不到）：
+
+1. 脚本打印授权 URL → 在你电脑浏览器打开、登录 Trae
+2. 浏览器会跳到一个**打不开的页面**（容器内的 `127.0.0.1:18080`）—— 这是**正常的**
+3. 复制地址栏里的**完整 URL 整段**，粘贴回终端回车
+4. 脚本解析 `refreshToken` → 换 access token → 写入 `./data/auths/trae-<uid>.json`
+
+> 同一账号多个设备号时，可用不同 `TRAE_DEVICE_ID` 各登录一次，便于日志区分。
+> 但注意：**多账号不需要多设备号**——去重键是「账号+设备」，同一设备号下多账号本就能各签一次。
+
+---
+
+### 登录完成后
+
+```bash
+docker compose restart workbuddy-wild
+docker compose logs --tail=30 workbuddy-wild   # 确认 loaded accounts 数量正确
+```
+
+---
+
+## 五、账号文件格式（手建时参考）
+
+```jsonc
+{
+  "auth": {
+    "accessToken": "明文 token（Linux 侧不加密）",
+    "refreshToken": "明文 refresh token",
+    "expiresAt": 1792332001,          // Unix 秒
+    "domain": "",                     // WorkBuddy: 空=国内, workbuddy.ai=国际
+                                      // TraeWork: 固定 "trae.cn"
+    "apiHost": "https://api.trae.com.cn",   // 仅 TraeWork
+    "machineId": "fc564da81dea87d0b816ce4c97ed08c0",  // 仅 TraeWork（32 位 hex）
+    "deviceId": "4484256452647802"                    // 仅 TraeWork（★ 签到必需）
+  },
+  "account": { "uid": "...", "enterpriseId": "", "nickname": "备注名" }
+}
+```
+
+- 文件名必须是 `workbuddy-<uid>.json` 或 `trae-<uid>.json`（前缀决定平台路由）。
+- 也支持扁平形 `{"accessToken":..., "uid":...}`。
+- `WB2A_REGION=cn` 时，`domain` 含 `workbuddy.ai` 的账号会被跳过（那是国际账号）。
+
+---
+
+## 六、对接与使用
 
 服务暴露 OpenAI 兼容接口：
 
-- `POST /v1/chat/completions` —— 模型名需带前缀：`workbuddy/glm-5.2`、`workbuddy/hy3` 等
-- `GET  /v1/models` —— 列出已接入账号可用的模型
-- `GET  /status`   —— 查看账号池
-- `GET  /healthz`  —— 健康检查
+| 端点 | 说明 |
+|------|------|
+| `POST /v1/chat/completions` | **模型名必须带前缀**：`workbuddy/glm-5.2` 或 `traework/glm-5.2` |
+| `GET /v1/models` | 列出两平台全部可用模型（各 10 个，共 20 个） |
+| `GET /status` | 账号池状态（按平台分组：`accounts.workbuddy` / `accounts.traework`） |
+| `GET /healthz` | 健康检查（无需鉴权） |
 
-示例（本地或局域网内）：
 ```bash
-curl http://<NAS_IP>:7863/v1/models \
-  -H "Authorization: Bearer <你的WB2A_API_KEY>"
+curl http://<NAS_IP>:7863/v1/models -H "Authorization: Bearer <WB2A_API_KEY>"
 ```
 
-在 OpenAI 客户端 / 聊天前端里填：
+在 OpenAI 客户端填：
 - Base URL：`http://<NAS_IP>:7863/v1`
 - API Key：你的 `WB2A_API_KEY`
-- 模型：`workbuddy/glm-5.2` 等
+- 模型：`workbuddy/glm-5.2`、`traework/glm-5.2` 等
 
-如需外网访问，用飞牛「Lucky」或 fnOS 反代到该端口并加 HTTPS（接口有 Bearer 鉴权，但建议仍走 HTTPS）。
-
----
-
-## 六、升级
-
-重新在开发机交叉编译新二进制覆盖 `workbuddy-wild-server` / `workbuddy-login`，传到 NAS 后：
-```bash
-docker compose up -d --build
-```
-`./data` 卷里的账号与状态不受影响，无需重新添加。
-
----
-
-## 七、排错
-
-| 现象 | 排查 |
-|------|------|
-| 容器 `Exited` / 起不来 | `docker compose logs workbuddy-wild`；确认没有去挂载 `config.json` 单文件；确认 `./data` 目录有写权限 |
-| `curl /healthz` 不通 | 容器端口映射 `7863:7863` 是否成功；`WB2A_LISTEN` 必须是 `:7863`（监听全部），不能是 `127.0.0.1:7863` |
-| `/v1/models` 返回空 | `auths/` 里没有账号文件，或 `domain`/`WB2A_REGION` 不匹配；`/status` 看加载了几条 |
-| 接口 401 | `WB2A_API_KEY` 与请求里的 Bearer 不一致 |
-| 模型报错 no_healthy_account | 账号 token 过期/被冷却，检查 `/status` 与日志里的 refresh 结果 |
-
----
-
-## 八、客户端接入：WorkBuddy 桌面端「添加自定义模型」
-
-在 WorkBuddy 客户端里「添加模型 → 自定义 / Custom」，按下面填，即可把对话路由到本服务：
-
-| 对话框字段 | 填写值 | 说明 |
-|------------|--------|------|
-| 接口地址 | `http://127.0.0.1:7863/v1/chat/completions` | 本机跑服务填这个；服务在 NAS 上则改成 `http://<NAS_IP>:7863/v1/chat/completions` |
-| API Key | 你的 `WB2A_API_KEY` | 默认 `WorkBuddy2API`；在 compose 里改过就填改后的值 |
-| 模型名称 | `workbuddy/glm-5.2` | **必须带 `workbuddy/` 前缀**，见下方可用列表 |
-| 工具调用 | 勾选 | 服务端支持 |
-| 图片输入 | 按需 | 部分模型支持 |
-| 推理模式 | 按需 | deepseek-v4 系列可开 |
-
-> 每个模型单独添加一条（点一次「保存」），对话时即可切换不同模型。
-
-**可用模型名称**（服务端 `internal/server/handler.go` 的静态列表，前缀均为 `workbuddy/`）：
+**可用模型**（静态列表，实际以 `/v1/models` 为准）：
 
 ```
-workbuddy/glm-5.2
-workbuddy/glm-5.1
-workbuddy/glm-5v-turbo
-workbuddy/kimi-k2.7
-workbuddy/minimax-m3
-workbuddy/hy3
-workbuddy/hy3-preview
+workbuddy/glm-5.2          traework/glm-5.2
+workbuddy/glm-5.1          traework/glm-5-turbo
+workbuddy/glm-5v-turbo     traework/glm-5
+workbuddy/kimi-k2.7        traework/DeepSeek-V4-Pro
+workbuddy/minimax-m3       traework/DeepSeek-V4-Flash
+workbuddy/hy3              traework/kimi-k2.6
+workbuddy/hy3-preview      traework/...
 workbuddy/hy3-preview-agent
 workbuddy/deepseek-v4-pro
 workbuddy/deepseek-v4-flash
 ```
 
-> 若账号 refresh 后服务端从上游拉到了动态模型列表，以 `/v1/models` 返回的为准（需带 `Bearer` 鉴权）：
-> ```bash
-> curl -H "Authorization: Bearer <你的WB2A_API_KEY>" http://<NAS_IP>:7863/v1/models
-> ```
+---
 
+## 七、环境变量速查
+
+| 变量 | 默认 | 说明 |
+|------|------|------|
+| `WB2A_LISTEN` | `:7863` | 监听地址。容器内**必须**是 `:7863`（不能 `127.0.0.1`） |
+| `WB2A_API_KEY` | — | Bearer 鉴权密钥。**留空=不鉴权**，仅限内网 |
+| `WB2A_AUTH_DIR` | `/data/auths` | 账号目录 |
+| `WB2A_STATE_FILE` | `/data/state.json` | 状态文件（同目录会派生 `state-workbuddy.json` / `state-traework.json`） |
+| `WB2A_REGION` | `cn` | `cn` 或 `global` |
+| `WB2A_STRATEGY` | `credits` | 选号策略：`credits` / `expire` / `roundrobin` |
+| `WB2A_MAX_ROTATE` | `3` | 单请求最多试几个账号 |
+| `WB2A_HARD_CREDIT` | `12h` | 余额不足冷却时长 |
+| `WB2A_SOFT_RATE` | `60s` | 限流冷却时长 |
+| `WB2A_ERR_THRESHOLD` | `3` | 累计错误几次进入冷却 |
+| `WB2A_ERR_COOLDOWN` | `10m` | 错误冷却时长 |
+| `WB2A_TIMEOUT_SECONDS` | `120` | 上游超时 |
+
+---
+
+## 八、升级
+
+1. 在开发机上重新交叉编译（在源码目录执行）：
+   ```bash
+   export GOROOT="<你的 Go 安装目录>"
+   GOOS=linux GOARCH=amd64 CGO_ENABLED=0 "$GOROOT/bin/go.exe" build -o docker/workbuddy-wild-server ./cmd/server
+   GOOS=linux GOARCH=amd64 CGO_ENABLED=0 "$GOROOT/bin/go.exe" build -o docker/workbuddy-login ./cmd/login
+   GOOS=linux GOARCH=amd64 CGO_ENABLED=0 "$GOROOT/bin/go.exe" build -o docker/workbuddy-login-trae ./cmd/login_trae
+   ```
+2. 把新的三个二进制传到 NAS 覆盖对应文件
+3. ```bash
+   docker compose up -d --build
+   ```
+
+`./data` 卷里的账号与状态不受影响，无需重新登录。
+
+---
+
+## 九、排错
+
+| 现象 | 排查 |
+|------|------|
+| 容器 `Exited` / 起不来 | `docker compose logs workbuddy-wild`；确认没有去挂载 `config.json` 单文件；确认 `./data` 有写权限 |
+| `curl /healthz` 不通 | 端口映射 `7863:7863`；`WB2A_LISTEN` 必须是 `:7863` |
+| `/v1/models` 只有一半模型 | 对应平台的 `auths/` 里没账号文件。看启动日志 `loaded accounts: workbuddy=N, traework=M` |
+| 日志出现 `检测到 Windows DPAPI 密文` | 你把 Windows 的 auth 文件直接拷过来了 → 在 NAS 上重新登录（第四节） |
+| traework 签到恒返 `9074` | 设备号不对/随机。用 `TRAE_DEVICE_ID` 传真实设备号重新登录 |
+| traework 报 `9095` | **不是错误**：= 今日已签到。服务端视为成功 |
+| `9074` 偶发（非恒定） | 瞬时限流。客户端会自动等 8s 重试一次，属正常 |
+| 接口 401 | `WB2A_API_KEY` 与请求里的 Bearer 不一致 |
+| `no_healthy_account` | 账号 token 过期/被冷却。查 `/status` 与日志里的 refresh 结果 |
+| 容器时间不对导致签到错过 | 确认 `TZ=Asia/Shanghai` |
+
+---
+
+## 十、安全提醒
+
+- `WB2A_API_KEY` 留空 = **接口完全无鉴权**，任何能访问该端口的人都能消耗你的账号额度。生产环境务必设置。
+- 账号 token 在 Linux 侧以**明文**存在 `/data/auths/*.json`，安全性完全依赖：
+  1. 宿主机文件权限（建议 `chmod 700 data/auths` 且非 root 运行）
+  2. 容器隔离边界（**不要把 `/data` 挂到共享目录**）
+- 如需外网访问，用飞牛「Lucky」或 fnOS 反代并启用 HTTPS。

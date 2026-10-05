@@ -1,11 +1,11 @@
 #!/bin/sh
-# 交互式登录助手（高级/可选）：
-# 在同一个容器会话内完成  url -> 浏览器授权 -> poll -> 写 auth 文件。
-# 用法（在 NAS 上，确保 ./data 已挂载）：
+# WorkBuddy 交互式登录助手（在 NAS 上使用）。
+#
+# 用法（在 docker-compose.yml 所在目录）：
 #   docker compose run --rm workbuddy-wild /app/login.sh
 #
-# 说明：cmd/login 的 state 文件硬编码在 /tmp，必须在「同一个容器」里一气呵成，
-# 因此不能拆成两次 docker 命令。请在本机会话内按提示操作。
+# 说明：登录 state 文件落在 /tmp，必须在「同一个容器会话」里一气呵成，
+# 因此不能拆成两次 docker compose run。请按提示在本会话内完成。
 set -e
 
 AUTH_DIR="${WB2A_AUTH_DIR:-/data/auths}"
@@ -14,8 +14,11 @@ mkdir -p "$AUTH_DIR"
 echo "==> 步骤1：获取授权 URL"
 URL=$(/app/workbuddy-login url)
 echo ""
+echo "================================================================"
 echo "请在浏览器打开以下地址并完成登录："
+echo ""
 echo "$URL"
+echo "================================================================"
 echo ""
 printf "登录完成后，回到这里按回车继续..."
 read _

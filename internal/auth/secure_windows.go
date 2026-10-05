@@ -1,5 +1,10 @@
+//go:build windows
+
 // Package auth 认证凭证的读写；此处提供 Windows DPAPI 加密工具，
 // 用于对 auth 文件中的 token 字段加密（仅当前 Windows 用户可解密）。
+//
+// 平台差异：DPAPI 是 Windows 专有 API，Linux/其他平台由 secure_other.go
+// 提供等价实现（明文直通 + 更严格的文件权限）。两边导出的函数签名必须一致。
 package auth
 
 import (

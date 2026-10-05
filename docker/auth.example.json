@@ -1,16 +1,56 @@
 {
-  "auth": {
-    "accessToken": "在此粘贴你的 accessToken（明文，NAS/Linux 无法解密 Windows DPAPI）",
-    "refreshToken": "在此粘贴你的 refreshToken",
-    "expiresAt": 1753600000,
-    "domain": "",
-    "apiHost": "",
-    "machineId": "",
-    "deviceId": ""
+  "_说明": [
+    "账号文件格式参考。文件名必须是 workbuddy-<uid>.json 或 trae-<uid>.json，",
+    "前缀决定平台路由。放到 NAS 的 ./data/auths/ 目录下，重启容器生效。",
+    "",
+    "★ 重要：Windows 桌面端导出的文件里 token 是 dpapi: 密文，Linux 无法解密，",
+    "  直接拷过去会失效。推荐用 login.sh / login-trae.sh 在 NAS 上重新登录。",
+    "  本模板用于手工填写明文 token 的场景。"
+  ],
+
+  "_WorkBuddy示例_文件名应为_workbuddy-uid.json": {
+    "auth": {
+      "accessToken": "在此粘贴明文 accessToken",
+      "refreshToken": "在此粘贴明文 refreshToken",
+      "expiresAt": 1792332001,
+      "domain": "",
+      "apiHost": "",
+      "machineId": "",
+      "deviceId": ""
+    },
+    "account": {
+      "uid": "你的 uid（须与文件名一致）",
+      "enterpriseId": "",
+      "nickname": "备注名"
+    }
   },
-  "account": {
-    "uid": "你的uid（文件名需为 workbuddy-<uid>.json）",
-    "enterpriseId": "",
-    "nickname": "备注名"
+
+  "_TraeWork示例_文件名应为_trae-uid.json": {
+    "auth": {
+      "accessToken": "在此粘贴明文 accessToken",
+      "refreshToken": "在此粘贴明文 refreshToken",
+      "expiresAt": 1792332001,
+      "domain": "trae.cn",
+      "apiHost": "https://api.trae.com.cn",
+      "machineId": "fc564da81dea87d0b816ce4c97ed08c0",
+      "deviceId": "4484256452647802"
+    },
+    "account": {
+      "uid": "你的 uid（须与文件名一致）",
+      "enterpriseId": "",
+      "nickname": "备注名"
+    }
+  },
+
+  "_字段说明": {
+    "accessToken": "访问令牌，必填",
+    "refreshToken": "刷新令牌，必填（过期后自动刷新用）",
+    "expiresAt": "Unix 秒。<=0 会被认为需立即刷新",
+    "domain": "WorkBuddy: 空=国内(cn)，workbuddy.ai=国际(global)；TraeWork: 固定 trae.cn",
+    "apiHost": "仅 TraeWork：https://api.trae.com.cn（默认值）",
+    "machineId": "仅 TraeWork：32 位 hex 机器号，可随机生成",
+    "deviceId": "仅 TraeWork：★ 客户端真实注册设备号（16 位数字），签到必需",
+    "uid": "账号唯一标识，须与文件名中的 uid 一致",
+    "nickname": "仅展示用"
   }
 }
