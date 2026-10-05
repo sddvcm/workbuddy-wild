@@ -9,6 +9,12 @@
 # 便于 `docker exec cat /app/config.json` 排查「实际生效的配置到底是什么」。
 set -e
 
+# json_escape: 把字符串里的 \ " 换行 制表 转义，防止路径/密钥含特殊字符时
+# 生成出非法 JSON（否则服务端启动即崩，排查成本很高）。
+json_escape() {
+    printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' | tr -d '\r\n\t'
+}
+
 AUTH_DIR="${WB2A_AUTH_DIR:-/data/auths}"
 STATE_FILE="${WB2A_STATE_FILE:-/data/state.json}"
 LISTEN="${WB2A_LISTEN:-:7863}"
@@ -17,17 +23,22 @@ REGION="${WB2A_REGION:-cn}"
 STRATEGY="${WB2A_STRATEGY:-credits}"
 MAX_ROTATE="${WB2A_MAX_ROTATE:-3}"
 
+# max_rotate 必须是非负整数，否则去掉非数字字符；空则回退 3
+case "$MAX_ROTATE" in
+    ''|*[!0-9]*) MAX_ROTATE=$(printf '%s' "$MAX_ROTATE" | tr -cd '0-9'); [ -z "$MAX_ROTATE" ] && MAX_ROTATE=3 ;;
+esac
+
 mkdir -p "$AUTH_DIR"
 mkdir -p "$(dirname "$STATE_FILE")"
 
 cat > /app/config.json <<EOF
 {
-  "listen": "${LISTEN}",
-  "api_key": "${API_KEY}",
-  "auth_dir": "${AUTH_DIR}",
-  "state_file": "${STATE_FILE}",
-  "region": "${REGION}",
-  "strategy": "${STRATEGY}",
+  "listen": "$(json_escape "$LISTEN")",
+  "api_key": "$(json_escape "$API_KEY")",
+  "auth_dir": "$(json_escape "$AUTH_DIR")",
+  "state_file": "$(json_escape "$STATE_FILE")",
+  "region": "$(json_escape "$REGION")",
+  "strategy": "$(json_escape "$STRATEGY")",
   "max_rotate": ${MAX_ROTATE}
 }
 EOF

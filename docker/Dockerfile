@@ -7,11 +7,11 @@
 #   workbuddy-login-trae   TraeWork 登录助手
 FROM alpine:3.20
 
-# ca-certificates: 服务端要对外发起 HTTPS（copilot.tencent.com / api.trae.cn 等上游）
-# tzdata: 定时签到/保活按本地时区
-# wget:   healthcheck 探测 /healthz
-# jq:     登录助手把 snake_case 输出转成 auth 嵌套形
-RUN apk add --no-cache ca-certificates tzdata wget jq
+# ★ 零 apk 依赖：镜像运行只依赖 alpine 自带的东西，不做任何网络拉取。
+#   ca-certificates → minirootfs 已内置 /etc/ssl/certs/ca-certificates.crt
+#   sh / ash / wget → busybox 自带（/bin/sh 与 /usr/bin/wget 均为 busybox 符号链接）
+#   jq              → 已消除：workbuddy-login auth 子命令直接产出 auth 嵌套形 JSON
+#   tzdata          → 已消除：时区靠 ENV TZ + 系统默认，签到逻辑用 UTC 时间戳
 
 WORKDIR /app
 

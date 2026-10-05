@@ -23,41 +23,9 @@ echo ""
 printf "登录完成后，回到这里按回车继续..."
 read _
 
-echo "==> 步骤2：轮询登录结果"
-OUT=$(/app/workbuddy-login poll) || { echo "登录未完成或被取消。"; exit 1; }
-echo "登录返回：$OUT"
-
-NOW=$(date +%s)
-# 把 cmd/login 的 snake_case 输出转换为服务端 auth 嵌套形，并换算 expiresAt = now + expires_in
-echo "$OUT" | jq -r --arg now "$NOW" '
-  . as $in
-  | ($in.expires_in // 0 | tonumber) as $exp
-  | ($now | tonumber) as $nown
-  | {
-      auth: {
-        accessToken:  ($in.access_token // ""),
-        refreshToken: ($in.refresh_token // ""),
-        expiresAt:    (($nown + $exp) | tonumber),
-        domain:       ($in.domain // ""),
-        apiHost:      "",
-        machineId:    "",
-        deviceId:     ""
-      },
-      account: {
-        uid:          ($in.uid // ""),
-        enterpriseId: ($in.enterprise_id // ""),
-        nickname:     ($in.nickname // "")
-      }
-    }' > /tmp/wb_auth.json
-
-UID_VAL=$(echo "$OUT" | jq -r '.uid // empty')
-if [ -z "$UID_VAL" ]; then
-  echo "错误：未获取到 uid，登录可能未完成。"
-  rm -f /tmp/wb_auth.json
-  exit 1
-fi
-
-DEST="$AUTH_DIR/workbuddy-$UID_VAL.json"
-mv /tmp/wb_auth.json "$DEST"
+echo "==> 步骤2：轮询登录结果并直接落盘"
+# login auth <authDir> 内部完成「换 token → 查 account → 写 auth 嵌套形文件」，
+# stdout 只输出写入的绝对路径。这样容器里就不需要 jq 了。
+DEST=$(/app/workbuddy-login auth "$AUTH_DIR") || { echo "登录未完成或失败。"; exit 1; }
 echo "==> 已写入账号文件：$DEST"
 echo "==> 重启服务以加载新账号：docker compose restart workbuddy-wild"

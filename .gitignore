@@ -30,6 +30,19 @@ test/
 # Generated binary
 genicon.exe
 
+# Docker 离线镜像打包产物（35MB，靠 Release 分发，不进 git）
+docker/dist/*.tar
+docker/dist/*.tar.gz
+docker/_imgbuild/rootfs/
+docker/_imgbuild/alpine.tar.gz
+docker/_imgbuild/out/
+
+# 但保留打包脚本与 dist 下的说明/脚本
+!docker/dist/README.txt
+!docker/dist/SHA256SUMS
+!docker/dist/load-image.sh
+!docker/dist/fnos-compose.yml
+
 # Docs：默认忽略抓包/临时产物，但保留正式文档
 docs/*.md
 docs/*.png

@@ -1,13 +1,17 @@
 // login.go — WorkBuddy CN OAuth 登录（与 CPA 插件 /root/qoderwork/workbuddy/oauth.go
 // 的 handleStartLogin + handlePollLogin 逐字一致的实现，CN realm only）。
 //
-// 两个子命令，由 login.sh 顺序驱动：
+// 三个子命令，由 login.sh 顺序驱动：
 //
 //	login url   → POST /v2/plugin/auth/state?platform=CLI 拿 state+authUrl，
 //	              state 落 /tmp/wb2api-login-state.json，stdout 打印授权 URL
 //	login poll  → 读 state，GET /v2/plugin/auth/token?state= 一次，
 //	              成功再 GET /v2/plugin/login/account?state= 拿 uid/nickname，
 //	              stdout 打印完整 token+account JSON
+//	login auth  → 同 poll，但 stdout 只打印一行「账号文件绝对路径」，
+//	              并直接以服务端 auth 嵌套形（auth{} + account{}）落盘到
+//	              <auth_dir>/workbuddy-<uid>.json。
+//	              ★ 这个子命令的存在就是为了消除容器里对 jq 的依赖。
 //
 // 无 PKCE（workbuddy 设备流由服务端签发 state，与 qoderwork 不同）。
 package main
@@ -20,6 +24,8 @@ import (
 	"net/http"
 	"net/http/cookiejar"
 	"os"
+	"path/filepath"
+	"strings"
 	"time"
 )
 
@@ -93,9 +99,122 @@ type loginState struct {
 	State string `json:"state"`
 }
 
+// pollBundle 是 url 之后一次轮询拿到的全部凭证。
+type pollBundle struct {
+	AccessToken  string
+	RefreshToken string
+	ExpiresIn    int64
+	Domain       string
+	UID          string
+	EnterpriseID string
+	Nickname     string
+}
+
+// doPoll 执行「读 state → 换 token → 查 account」全流程，供 poll/auth 共用。
+// 返回的 error 已经是可以直接展示给用户的中文提示。
+func doPoll(client *http.Client) (*pollBundle, error) {
+	raw, err := os.ReadFile(stateFile)
+	if err != nil {
+		return nil, fmt.Errorf("read state: %v (先跑 login url)", err)
+	}
+	var ls loginState
+	if err := json.Unmarshal(raw, &ls); err != nil {
+		return nil, fmt.Errorf("parse state: %v", err)
+	}
+	// handlePollLogin (oauth.go:108-162)：auth/token 是权威登录状态端点，
+	// pending 时业务 code 非 0（"login ing"），完成时 code=0 + token bundle
+	tokRaw, status, errTok := doJSON(client, http.MethodGet, endpointAuthToken+ls.State, nil, nil)
+	if errTok != nil {
+		if status == 0 || status >= 500 {
+			return nil, fmt.Errorf("token endpoint error: %v", errTok)
+		}
+		return nil, fmt.Errorf("登录未完成（waiting for login）。请确认已在浏览器完成登录再按回车")
+	}
+	var tok struct {
+		AccessToken  string `json:"accessToken"`
+		RefreshToken string `json:"refreshToken"`
+		ExpiresIn    int64  `json:"expiresIn"`
+		Domain       string `json:"domain"`
+	}
+	if err := json.Unmarshal(tokRaw, &tok); err != nil || tok.AccessToken == "" {
+		return nil, fmt.Errorf("登录未完成（waiting for login）。请确认已在浏览器完成登录再按回车")
+	}
+	// login/account 拿 uid/nickname（带 Bearer）
+	var acct struct {
+		UID          string `json:"uid"`
+		EnterpriseID string `json:"enterpriseId"`
+		Nickname     string `json:"nickname"`
+	}
+	acctHeaders := func(r *http.Request) {
+		commonHeaders(r)
+		r.Header.Set("Authorization", "Bearer "+tok.AccessToken)
+	}
+	if acctRaw, _, errAcct := doJSON(client, http.MethodGet, endpointLoginAcct+ls.State, acctHeaders, nil); errAcct == nil {
+		_ = json.Unmarshal(acctRaw, &acct)
+	}
+	b := &pollBundle{
+		AccessToken:  tok.AccessToken,
+		RefreshToken: tok.RefreshToken,
+		ExpiresIn:    tok.ExpiresIn,
+		Domain:       tok.Domain,
+		UID:          acct.UID,
+		EnterpriseID: acct.EnterpriseID,
+		Nickname:     acct.Nickname,
+	}
+	os.Remove(stateFile)
+	return b, nil
+}
+
+// authFile 是服务端 auth 文件格式（嵌套形）：auth{...} + account{...}。
+// 与 internal/auth/auth.go 的解析结构逐字段对齐。
+type authFile struct {
+	Auth struct {
+		AccessToken  string `json:"accessToken"`
+		RefreshToken string `json:"refreshToken"`
+		ExpiresAt    int64  `json:"expiresAt"`
+		Domain       string `json:"domain"`
+		ApiHost      string `json:"apiHost"`
+		MachineID    string `json:"machineId"`
+		DeviceID     string `json:"deviceId"`
+	} `json:"auth"`
+	Account struct {
+		UID          string `json:"uid"`
+		EnterpriseID string `json:"enterpriseId"`
+		Nickname     string `json:"nickname"`
+	} `json:"account"`
+}
+
+// writeAuthFile 把 poll 结果落盘为 <authDir>/workbuddy-<uid>.json（0600）。
+// 返回写入的绝对路径。
+func writeAuthFile(b *pollBundle, authDir string) (string, error) {
+	if strings.TrimSpace(b.UID) == "" {
+		return "", fmt.Errorf("未获取到 uid，登录可能未完成")
+	}
+	if err := os.MkdirAll(authDir, 0o700); err != nil {
+		return "", fmt.Errorf("mkdir %s: %v", authDir, err)
+	}
+	var af authFile
+	af.Auth.AccessToken = b.AccessToken
+	af.Auth.RefreshToken = b.RefreshToken
+	af.Auth.ExpiresAt = time.Now().Unix() + b.ExpiresIn
+	af.Auth.Domain = b.Domain
+	af.Account.UID = b.UID
+	af.Account.EnterpriseID = b.EnterpriseID
+	af.Account.Nickname = b.Nickname
+	data, err := json.MarshalIndent(af, "", "  ")
+	if err != nil {
+		return "", err
+	}
+	dest := filepath.Join(authDir, "workbuddy-"+b.UID+".json")
+	if err := os.WriteFile(dest, data, 0o600); err != nil {
+		return "", fmt.Errorf("write %s: %v", dest, err)
+	}
+	return dest, nil
+}
+
 func main() {
 	if len(os.Args) < 2 {
-		fatal("usage: login <url|poll>")
+		fatal("usage: login <url|poll|auth>")
 	}
 	// 每个流程独立 cookie jar（oauth.go:22-29：多账号登录互不串会话）
 	jar, _ := cookiejar.New(nil)
@@ -122,59 +241,39 @@ func main() {
 		fmt.Println(st.AuthURL)
 
 	case "poll":
-		raw, err := os.ReadFile(stateFile)
+		b, err := doPoll(client)
 		if err != nil {
-			fatal("read state: %v (先跑 login url)", err)
-		}
-		var ls loginState
-		if err := json.Unmarshal(raw, &ls); err != nil {
-			fatal("parse state: %v", err)
-		}
-		// handlePollLogin (oauth.go:108-162)：auth/token 是权威登录状态端点，
-		// pending 时业务 code 非 0（"login ing"），完成时 code=0 + token bundle
-		tokRaw, status, errTok := doJSON(client, http.MethodGet, endpointAuthToken+ls.State, nil, nil)
-		if errTok != nil {
-			if status == 0 || status >= 500 {
-				fatal("token endpoint error: %v", errTok)
-			}
-			fatal("登录未完成（waiting for login）。请确认已在浏览器完成登录再按 y")
-		}
-		var tok struct {
-			AccessToken  string `json:"accessToken"`
-			RefreshToken string `json:"refreshToken"`
-			ExpiresIn    int64  `json:"expiresIn"`
-			Domain       string `json:"domain"`
-		}
-		if err := json.Unmarshal(tokRaw, &tok); err != nil || tok.AccessToken == "" {
-			fatal("登录未完成（waiting for login）。请确认已在浏览器完成登录再按 y")
-		}
-		// login/account 拿 uid/nickname（带 Bearer）
-		var acct struct {
-			UID          string `json:"uid"`
-			EnterpriseID string `json:"enterpriseId"`
-			Nickname     string `json:"nickname"`
-		}
-		acctHeaders := func(r *http.Request) {
-			commonHeaders(r)
-			r.Header.Set("Authorization", "Bearer "+tok.AccessToken)
-		}
-		if acctRaw, _, errAcct := doJSON(client, http.MethodGet, endpointLoginAcct+ls.State, acctHeaders, nil); errAcct == nil {
-			_ = json.Unmarshal(acctRaw, &acct)
+			fatal("%v", err)
 		}
 		out := map[string]any{
-			"access_token":  tok.AccessToken,
-			"refresh_token": tok.RefreshToken,
-			"expires_in":    tok.ExpiresIn,
-			"domain":        tok.Domain,
-			"uid":           acct.UID,
-			"enterprise_id": acct.EnterpriseID,
-			"nickname":      acct.Nickname,
+			"access_token":  b.AccessToken,
+			"refresh_token": b.RefreshToken,
+			"expires_in":    b.ExpiresIn,
+			"domain":        b.Domain,
+			"uid":           b.UID,
+			"enterprise_id": b.EnterpriseID,
+			"nickname":      b.Nickname,
 		}
 		oraw, _ := json.Marshal(out)
 		fmt.Println(string(oraw))
-		os.Remove(stateFile)
+
+	case "auth":
+		// 用法：login auth [authDir]   —— authDir 缺省 /data/auths
+		authDir := "/data/auths"
+		if len(os.Args) >= 3 && strings.TrimSpace(os.Args[2]) != "" {
+			authDir = os.Args[2]
+		}
+		b, err := doPoll(client)
+		if err != nil {
+			fatal("%v", err)
+		}
+		dest, err := writeAuthFile(b, authDir)
+		if err != nil {
+			fatal("%v", err)
+		}
+		fmt.Println(dest)
 
 	default:
-		fatal("unknown subcommand %q (want url|poll)", os.Args[1])
+		fatal("unknown subcommand %q (want url|poll|auth)", os.Args[1])
 	}
 }
