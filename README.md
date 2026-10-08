@@ -25,6 +25,51 @@
 
 ## 更新记录
 
+### v0.7.5（2026-10-08）
+- **修复「最小化后无法唤出面板」**（用户实测反馈：缩到托盘后再点托盘，面板不出来）
+
+  **根因 · Wails runtime 调用会永久阻塞**
+  - `showPanelNow` 持 `showMu` 依次调 `WindowSetSize / SetPosition / Show / EventsEmit`。
+    **WebView2 无响应时这些调用不是超时报错，而是永不返回** ——
+    于是 `defer showMu.Unlock()` 永不执行，锁被永久持有，此后所有托盘唤起静默失败
+  - 日志特征：最后一次「窗口已恢复」之后 **94 分钟零输出**，
+    但定时签到照常执行 —— **进程活着，面板通路死了**
+  - 附带发现：`resizePanel` 完全无防护，且**绕过 `showMu`** 直接争抢同一条 runtime 通道；
+    `HidePanel` 连日志都没有，导致"用户点了什么"无法从日志复原
+
+  **修复**
+  - 新增 `runtimeCall(name, fn)`：加 1.5s 超时 + `recover` 隔离 panic
+  - 新增 `tryLockTimeout(mu, d)`：带超时的锁获取，替代裸 `Lock()`
+  - `showPanelNow` / `resizePanel` 共用 `showMu`，全部 runtime 调用包裹
+  - `HidePanel` 补日志；`RestoreAndShow` 的 else 分支补日志
+  - **`ForceQuit` 的 `runtime.Quit` 也加超时** —— 原实现卡死时会永久阻塞，
+    导致 `os.Exit` 兜底永远不可达（**程序反而退不出去**）
+  - 新增 7 个防护测试，其中 `TestShowMuNotHeldAfterBlockedShow`
+    专门证明「卡死后仍能被再次唤起」
+
+- **修复 9074 死分支 —— 延迟重试队列此前完全失活**
+
+  **根因 · 一条三环断链**
+  - `scheduler.go` 的 `else if isRateLimited(checkinErr)` **永不成立**：
+    `*ErrCheckinRateLimited.IsRateLimited()` 恒为 `false` → 9074 掉到兜底文案，
+    用户看到英文原文 `checkin 9074 (transient throttle): ...`
+  - `CheckinResult.Retryable` **全仓库无赋值点** → `markRetryable()` /
+    `retryState` / 延迟重试队列整条链路实现完整却永不触发，
+    「稍后自动重试」是空头承诺，实际要等下一个定时点（可能数小时）
+  - 对应测试是**假阳性**：用裸 `errors.New` 模拟 9074，
+    裸 error 不实现任何接口 → 测的是兜底 `false` 路径，所以完全没拦住
+
+  **修复**
+  - `ErrCheckinRateLimited` 新增 `IsCheckinThrottled()` / `AttemptCount()`；
+    `IsRateLimited()` 保持 `false`（注释澄清这只是"不落进通用限流分支"，**不是**"重试无用"）
+  - 调度器新增 `isCheckinThrottled()` 判定，9074 分支改用它，
+    置 `Retryable=true`，文案改中文「当前签到人数过多，将在稍后自动重试」
+  - 测试重写为用**真实错误类型**，并新增端到端用例验证
+    `9074 → Retryable → markRetryable → dueRetries` 全链路可达
+  - **反向验证**：把分支退回旧写法后新测试立即 FAIL，
+    失败信息精确指向缺陷 —— 证明已不是假阳性
+  - 顺带修正 `CheckinClaim` 等处 3 段与代码行为相反的过时注释
+
 ### v0.7.3（2026-10-02）
 - **修复两个仍在漏的错误识别缺口**（v0.7.2 遗留）
 
