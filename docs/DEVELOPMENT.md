@@ -675,6 +675,50 @@ wails UniqueId  = workbuddy-wild-gui-v1
 2. `ShowPanel` 的 `domReadyCh` 已关闭分支 **go 化**（调用方永不阻塞）
 3. 托盘回调全部 `go func()`
 
+以上三层解决的是「**要不要调** runtime」。但还有一个更隐蔽的失效面：
+**调了之后 runtime 本身不返回**。这需要第四层，见 6.11。
+
+### 6.11 ⚠️ 铁律：所有 Wails runtime 调用必须经 `runtimeCall` 加超时（v0.7.4）
+
+**背景（2026-10-08 实测事故，v0.7.3）**
+
+`showPanelNow` 持 `showMu` 依次调用 `WindowSetSize / WindowSetPosition / WindowShow / EventsEmit`。
+**WebView2 无响应时这些 runtime 调用会永久阻塞** —— 不是超时报错，是永不返回。
+于是 `defer showMu.Unlock()` 永不执行，`showMu` 被永久持有：
+
+```
+07:25:37.196  面板窗口已从最小化/隐藏状态恢复   ← 最后一次成功
+              ……… 94.4 分钟日志完全空白 ………
+09:00:00.xxx  定时签到批次正常执行              ← 进程活着，但面板通路已死
+```
+
+关键鉴别点：**进程存活 + 面板通路静默**（不是崩溃、不是事件风暴）。
+对照 2026-10-06 那次是 248 行 refresh 刷屏，**两者不是同一个问题**。
+
+**铁律内容**
+
+| 规则 | 说明 |
+|------|------|
+| 所有 runtime 调用走 `runtimeCall(name, fn)` | 超时 1.5s 放弃等待 + `recover` 隔离 panic |
+| 所有窗口操作锁用 `tryLockTimeout(mu, 2s)` | 绝不用裸 `mu.Lock()`；锁被僵死调用持有时不能永久排队 |
+| `showPanelNow` 与 `resizePanel` **必须共用同一把 `showMu`** | 二者抢同一条 runtime 通道，早前 `resizePanel` 完全无防护且绕过锁 |
+| `HidePanel` 必须有日志 | 此前完全静默，导致「用户点了什么」无法从日志复原，是诊断最大盲区 |
+| `RestoreAndShow` 的 `else` 分支必须有日志 | 否则无法区分「事件未送达」与「窗口已可见无需恢复」 |
+| `ForceQuit` 的 `runtime.Quit` 也必须加超时 | **否则 WebView2 卡死时 `os.Exit` 兜底永远不可达，程序反而退不出去** |
+
+**为什么超时后不等待调用结束**
+
+僵死的调用会随 WebView2 一起僵死到底。`runtimeCall` 弃它而去，是为了让
+**锁必被释放、调用方必能推进**。泄漏的 goroutine 数量上限 = 卡死期间尝试的
+runtime 调用次数，属可接受代价（远优于整条面板通路永久死亡）。
+
+**回归测试**
+
+`internal/app/runtime_guard_test.go` 共 7 例。其中
+`TestShowMuNotHeldAfterBlockedShow` 是本次事故的**针对性回归**：
+模拟一个永不返回的 runtime 调用穿过 `showMu` 临界区，
+断言 `showMu` 仍在 1.5s 内被释放 —— 即「卡死后仍能被再次唤起」。
+
 ---
 
 ## 7. 关键技术难点
@@ -764,6 +808,8 @@ Linux 侧遇 `dpapi:` 前缀返回**空串**（刻意设计，避免拿密文请
 | 用 `IFileOperation` 做文件操作（本机） | ❌ `CoCreateInstance` 报 `0x80004002 不支持此接口` |
 | PyInstaller 打包时删已存在的 dist（本机） | ❌ 被 safe-delete 守卫拦；解法是**换全新输出目录名** |
 | 原生托盘右键菜单 | ❌ `TrackPopupMenu` 模态循环导致随机卡死 |
+| 裸 `Wails runtime` 调用 + 裸 `mu.Lock()` 做窗口操作 | ❌ WebView2 无响应时 runtime **永久阻塞** → 锁永不释放 → 面板通路静默死亡。**必须**经 `runtimeCall` + `tryLockTimeout`（§6.11） |
+| 在持锁路径里同步调 `runtime.Quit` | ❌ WebView2 卡死时永久阻塞，`os.Exit` 兜底**永远不可达**（程序退不出去） |
 
 ---
 
@@ -785,12 +831,15 @@ Linux 侧遇 `dpapi:` 前缀返回**空串**（刻意设计，避免拿密文请
 | v0.7.1 | ✅ 模型名写错不再冷却账号池；新增 `ErrBadModel` 分类 |
 | v0.7.2 | ✅ 修正「200 伪装错误」被当作模型回答透传（in-band error） |
 | v0.7.3 | 修复两个遗漏的错误识别缺口（D1 + D2） |
+| v0.7.4 | ✅ 修复「最小化后无法唤出面板」：runtime 调用加超时 + 锁带超时（§6.11） |
 | v0.8.0 | ✅ 飞牛 NAS Docker 双平台部署 + **网页管理面板** |
 
 **每次修复的共性教训**：
 1. 上游字段语义**必须靠真实抓包 + 与官方显示对照**确认，不能靠字段名猜。
 2. 「看起来是错误」的响应可能藏在 **HTTP 200 的正常流里**（in-band）。
 3. 账号级 vs 设备级 vs 全局级的作用域，**必须用单变量矩阵实验**确定。
+4. GUI 侧的第三方调用（Wails runtime / WebView2）**没有超时保证**。
+   凡「持锁 + 调用外部」的组合，都可能变成永久阻塞。**锁必须带超时，调用必须包超时。**
 
 ---
 
@@ -853,8 +902,15 @@ Linux 侧遇 `dpapi:` 前缀返回**空串**（刻意设计，避免拿密文请
 
 - [ ] `main.go`：chdir → 单实例锁 → 配置 → 组装 → HTTP → 托盘 → `wails.Run`
 - [ ] `internal/app/app.go`：26 个导出方法 + 5 个事件
+- [ ] ⚠️ **必须实现 `runtimeCall(name, fn)` 与 `tryLockTimeout(mu, d)`**（§6.11）
+  - [ ] `showPanelNow` / `resizePanel` 共用 `showMu`，均**带超时获取**
+  - [ ] 全部 `runtime.*` 调用（含 `runtime.Quit`）都在 `runtimeCall` 闭包内
+  - [ ] `HidePanel` / `RestoreAndShow` 的 else 分支**均有日志**
 - **前置资源**：Step 3-6 全部
-- **验证**：`wails build` 产出 exe，双击启动无白窗口
+- **验证**：`wails build` 产出 exe，双击启动无白窗口；
+  且 `runtime_guard_test.go` 7 例通过（尤其 `TestShowMuNotHeldAfterBlockedShow`）
+- **反验证（关键）**：把某个 runtime 调用换成永不返回的桩，确认 `showMu`
+  仍会在 1.5s 内释放、后续唤起仍能成功 —— 这是本次事故的针对性回归
 
 ### Step 8：网页管理面板（v0.8.0）
 
