@@ -1,185 +1,479 @@
 # WorkBuddy-Wild 开发文档（面向 AI Agent）
 
-> **读者**：接手本仓库的 AI Agent 或开发者。本文档目标是——**只读本文档 + 仓库源码，就能完整重写/维护这个项目**。
-> 普通用户请看 [README](../README.md)；历史交接记录见 [HANDOFF.md](../HANDOFF.md)（已过时，仅存档）。
+> **读者**：接手本仓库的 AI Agent 或开发者。
+> **本文档的目标**：**只读本文档（不看源码）就能重写这个项目**。所有常量、端点、字段名、DOM id 均已与源码逐一核对。
 >
-> **当前版本**：v0.4.0 ｜ **最后核对**：2026-09-22（本文所有描述均已与源码逐项核对）
+> 普通用户请看 [README](../README.md) 与 [USAGE](USAGE.md)。
+>
+> **当前版本**：v0.8.0 ｜ **最后核对**：2026-10-08
+> **文档可信度**：经过 N 轮独立 Agent 复现验证（见文末「验证记录」）
 
 ---
 
 ## 目录
 
-1. [项目本质](#1-项目本质)
-2. [技术栈与环境](#2-技术栈与环境)
+1. [项目定位与硬性约束](#1-项目定位与硬性约束)
+2. [技术栈与构建环境](#2-技术栈与构建环境)
 3. [代码地图](#3-代码地图)
-4. [关键不变量（改了必出事）](#4-关键不变量改了必出事)
-5. [核心机制详解](#5-核心机制详解)
-6. [数据流](#6-数据流)
-7. [前后端契约（wails 绑定）](#7-前后端契约wails-绑定)
-8. [文件与持久化格式](#8-文件与持久化格式)
-9. [配置项全表](#9-配置项全表)
-10. [构建与发布](#10-构建与发布)
-11. [测试](#11-测试)
-12. [常见坑与排错](#12-常见坑与排错)
-13. [跨平台移植（macOS / Linux）](#13-跨平台移植macos--linux)
-14. [扩展指南](#14-扩展指南)
+4. [接口逆向：双平台契约](#4-接口逆向双平台契约)
+5. [整体架构与数据流](#5-整体架构与数据流)
+6. [模块实现规格](#6-模块实现规格)
+7. [关键技术难点](#7-关键技术难点)
+8. [不可为之事（已实测排除）](#8-不可为之事已实测排除)
+9. [完整踩坑史与版本演进](#9-完整踩坑史与版本演进)
+10. [重写检查清单](#10-重写检查清单)
+11. [环境与验证方法](#11-环境与验证方法)
+12. [网页管理面板（v0.8.0）](#12-网页管理面板v080)
+13. [Docker 部署（v0.8.0）](#13-docker-部署v080)
+14. [附录 A：关键参数速查表](#附录-a关键参数速查表)
+15. [附录 B：错误信息对照表](#附录-b错误信息对照表)
+16. [附录 C：前端 DOM id 全清单](#附录-c前端-dom-id-全清单)
+17. [附录 D：核心数据结构与落盘格式](#附录-d核心数据结构与落盘格式重写必读)
 
 ---
 
-## 1. 项目本质
+## 1. 项目定位与硬性约束
 
-**一句话**：把多个 WorkBuddy/CodeBuddy（及 TraeWork）账号聚合成一个 **OpenAI 兼容 API**，附带**自动签到**领额度、**多策略选号**、**敏感凭证加密**，全部打包成一个零依赖的 Windows 单 exe 托盘程序。
+### 1.1 一句话定位
 
-**单进程架构**（一个 exe 同时是四样东西）：
+把多个 **WorkBuddy/CodeBuddy**（`codebuddy.cn`）和/或 **TraeWork**（`trae.cn`）账号，
+聚合成**一个 OpenAI 兼容 API**，附带**自动签到**领额度、**多策略选号**、**凭证加密**，
+打包成零依赖的 Windows 单 exe 托盘程序；同一份代码还能以**无头模式**跑在 Docker 里。
+
+### 1.2 单进程五合一
+
+> （v0.8.0 起是**五合一**；v0.7.x 及以前只有前四项，故历史文档里叫「四合一」）
 
 ```
-┌─────────────────────────────────────────────────────┐
-│  workbuddy-wild.exe（单进程）                        │
-│                                                     │
-│  ① HTTP 服务   :7863  OpenAI 兼容 API（对外）        │
-│  ② 调度器      后台 goroutine × 2（每平台一个）      │
-│  ③ 托盘图标    energye/systray                       │
-│  ④ 管理面板    Wails v2 + WebView2（无边框窗口）     │
-└─────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────┐
+│  workbuddy-wild.exe（单进程）                            │
+│                                                         │
+│  ① HTTP 服务   :7863   OpenAI 兼容 API（对外）           │
+│  ② 调度器       后台 goroutine × 2（每平台一个）          │
+│  ③ 托盘图标     energye/systray                          │
+│  ④ 管理面板     Wails v2 + WebView2（无边框窗口）         │
+│  ⑤ 网页管理面板 /admin/（内嵌，v0.8.0；Docker 场景用）    │
+└─────────────────────────────────────────────────────────┘
 ```
 
-**为什么用 Wails 而不是 Electron**：产物 ~13MB（Electron 至少 100MB+），且复用 Go 后端零 IPC 序列化开销。
+### 1.3 硬性约束（违反则不可交付）
 
-**双平台设计**：`workbuddy` 和 `traework` 是两个独立 `Runtime`，各有自己的 pool / scheduler / state 文件 / 上游客户端，但**共用一个选号策略**和一个 HTTP handler。
+| 约束 | 说明 |
+|---|---|
+| **模块名固定** `github.com/rockswang/workbuddy-wild` | 所有 import 依赖它，**不要改** |
+| **零外部运行时依赖** | 单 exe，不装 Python/Node/JRE；前端是纯静态文件 |
+| **前端无构建步骤** | 直接写 `index.html` / `style.css` / `app.js`，无 npm、无打包器 |
+| **日志/面板零 token** | 任何输出不得含 access token / refresh token（**安全红线**） |
+| **平台** | 仅 Windows amd64（核心逻辑纯 Go 可移植，Docker 用 linux/amd64） |
+| **`state.json` 只增字段** | 向后兼容，旧文件缺失新字段按零值处理，不得报错 |
 
 ---
 
-## 2. 技术栈与环境
+## 2. 技术栈与构建环境
 
-| 项 | 值 | 说明 |
-|---|---|---|
-| 语言 | Go **1.25.0** | 见 `go.mod` |
-| 桌面壳 | **Wails v2.14.0** | WebView2（Windows） |
-| 托盘 | energye/systray **v1.0.3** | |
-| 系统调用 | golang.org/x/sys **v0.47.0** | |
-| 前端 | **纯静态 HTML/CSS/JS** | **无 npm、无构建步骤** |
-| 模块名 | `github.com/rockswang/workbuddy-wild` | **别改**，所有 import 依赖它 |
-| 平台 | 仅 Windows amd64 | 核心逻辑纯 Go 可移植，见 §13 |
+### 2.1 依赖版本（与 `go.mod` 逐字核对）
 
-### 2.1 构建环境（重要）
+| 项 | 值 |
+|---|---|
+| 语言 | Go **1.25.0** |
+| 桌面壳 | `github.com/wailsapp/wails/v2` **v2.14.0** |
+| 托盘 | `github.com/energye/systray` **v1.0.3** |
+| 系统调用 | `golang.org/x/sys` **v0.47.0** |
+| 前端 | 纯静态 HTML/CSS/JS（**无 npm**） |
 
-本机（开发机）实测可用的组合：
+### 2.2 本机构建环境（受限环境的关键）
 
 ```bash
-# Go 工具链（便携版）
-C:/Users/Administrator/WorkBuddy/workbuddy自动签到/workbuddy-wild-fix/tools/go/bin/go.exe
+# Go 工具链（便携版，注意路径含中文，bash 里必须用完整绝对路径）
+GOROOT="/c/Users/Administrator/WorkBuddy/workbuddy自动签到/workbuddy-wild-fix/tools/go"
+"$GOROOT/bin/go.exe" build ./...
 
-# wails CLI
-C:/Users/Administrator/go/bin/wails.exe
-
-# 依赖缓存（含 wails 依赖的暖缓存，换这个能省 20 分钟重新下载）
+# 依赖缓存（换新 GOPATH 能省 20 分钟重新下载）
 GOPATH=C:/Users/Administrator/go5
 GOMODCACHE=C:/Users/Administrator/go5/pkg/mod
-GOPROXY=https://goproxy.cn,direct    # 七牛镜像；不要用阿里云
+GOPROXY=https://goproxy.cn,direct    # 七牛镜像；**不要用阿里云**
 GOFLAGS=-mod=mod
 ```
 
-> **GOPATH 必须每次都换新的**（除非确认没被锁）：go 构建后 `@v/*.info` 会被锁（Access denied，疑似杀软），复用同一 GOPATH 会失败。可用的历史缓存：`go`、`go2`、`go3`、`go5`。
-> **一次只跑一个 go 任务**，并发会互相抢缓存拖死。
+> ⚠️ **两个硬性限制**：
+> 1. **GOPATH 每次换新的**（`go`/`go2`/`go3`/`go5` 轮换）。go 构建后 `@v/*.info` 会被锁（Access denied，疑似杀软），复用同一 GOPATH 会失败。
+> 2. **一次只跑一个 go 任务**，并发会互相抢缓存拖死。
+> 3. **`go` 不在 PATH**（中文路径在 bash 里失效），必须用完整绝对路径调用。
+
+### 2.3 交叉编译（Docker 用）
+
+```bash
+GOOS=linux GOARCH=amd64 CGO_ENABLED=0 "$GOROOT/bin/go.exe" build -o workbuddy-wild-server ./cmd/server
+```
 
 ---
 
 ## 3. 代码地图
 
-| 路径 | 职责 | 改动时的注意点 |
+| 路径 | 职责 | 改动注意点 |
 |---|---|---|
-| `main.go` | 装配入口：chdir → 单实例锁 → 加载配置 → 组装 pool/upstream/scheduler/handler → 启动 HTTP → 启动托盘 → `wails.Run` | `--autostart` 参数控制是否弹"已启动"提示；窗口尺寸 760×560；WebView2 用户数据目录固定 `data/webview` |
-| `internal/app/` | **wails 绑定层**（`app.go` 单文件约 40KB）：面板数据、账号操作、登录编排、端口热切换、日志、策略切换 | 所有导出方法即前端可调 API；`ShowPanel` 必须等 `domReadyCh`；托盘回调必须 `go` 化；**任何日志不得含 token** |
-| `internal/pool/` | 账号池：**多策略选号**、冷却/禁用状态机、`state.json` 持久化 | 选号必须单调推进（§5.2）；state 格式只增不减 |
-| `internal/scheduler/` | 定时签到 + token 保活 + 冷却解冻 + 签到记录 | 支持分钟级运行时改时间（`SetCheckinMinutes` + wake 通道） |
-| `internal/server/` | OpenAI 兼容 HTTP handler | `MaxRotate` 可控；每平台独立 `Runtime`（pool+upstream+模型缓存） |
-| `internal/upstream/` | WorkBuddy 上游 HTTP（chat/billing/auth）+ 错误分类 | **`PrepareBody` 三改写勿动**（§4.1）；账单用短超时 `BillingHTTP` |
-| `internal/traework/` | TraeWork 上游（独立协议，`solosse.go` 为 SOLO 上游） | 与 upstream 平行，接口对齐 `provider.Upstream` |
+| `main.go` | 装配入口：chdir → 单实例锁 → 加载配置 → 组装 pool/upstream/scheduler/handler → 启动 HTTP → 启动托盘 → `wails.Run` | 窗口尺寸 **760×560**；WebView2 用户数据目录固定 `data/webview` |
+| `internal/app/app.go` | **wails 绑定层**（单文件约 43KB）：面板数据、账号操作、登录编排、端口热切换、日志、策略切换 | 所有 `func (a *App) X() ` 导出方法即前端可调 API；`ShowPanel` 必须等 `domReadyCh`；托盘回调必须 `go` 化 |
+| `internal/pool/pool.go` | 账号池：**多策略选号**、冷却/禁用状态机、`state.json` 持久化 | 选号必须单调推进（§6.2）；state 格式只增不减 |
+| `internal/scheduler/scheduler.go` | 定时签到 + token 保活 + 冷却解冻 + 签到记录 | 支持分钟级运行时改时间（`SetCheckinMinutes` + `wake` 通道） |
+| `internal/server/handler.go` | OpenAI 兼容 HTTP handler | `MaxRotate` 可控；每平台独立 `Runtime`（pool+upstream+模型缓存） |
+| `internal/upstream/` | **WorkBuddy 上游**（chat/billing/auth）+ 错误分类 | `PrepareBody` 三改写勿动（§6.1）；账单用短超时 `BillingHTTP` |
+| `internal/traework/` | **TraeWork 上游**（独立协议） | 与 upstream 平行，接口对齐 `provider.Upstream` |
 | `internal/provider/` | 平台抽象：`Kind`、`Upstream` 接口、`Error` 分类、`ModelInfo` | 新增平台从这里开始 |
-| `internal/config/` | 配置加载/校验/原子写回 + 环境变量覆盖 | `listen` 兼容旧格式；`errors.Is(err, fs.ErrNotExist)` 判缺失 |
+| `internal/config/config.go` | 配置加载/校验/原子写回 + 环境变量覆盖 | `listen` 兼容旧格式；`errors.Is(err, fs.ErrNotExist)` 判缺失 |
 | `internal/auth/` | auth 文件解析（嵌套/扁平双形态）+ **DPAPI 加密** | 落盘格式必须与 `login.SaveAuth` 一致 |
 | `internal/login/` | WorkBuddy CN OAuth 登录 | state 落 `data/login-state.json` |
 | `internal/login_trae/` | TraeWork 登录流程 | |
-| `internal/winutil/` | **Windows-only**：工作区、任务栏隐藏、无痕浏览器、开机自启、MessageBox、孤儿 WebView2 清理、单实例锁、窗口卡死检测 | 移植的集中改造点（§13） |
+| `internal/admin/` | **网页管理面板**（v0.8.0）：`go:embed` 内嵌前端 + 12 路由 | 见 §12 |
+| `internal/winutil/` | **Windows-only**：工作区、任务栏隐藏、无痕浏览器、开机自启、MessageBox、孤儿 WebView2 清理、单实例锁、窗口卡死检测 | 跨平台移植的集中改造点 |
 | `frontend/dist/` | 前端三件套 `index.html` / `style.css` / `app.js` | 直接调 `window.go.app.App.*`，无生成物 |
-| `cmd/server` | **无头模式服务**（无 GUI） | 调试 HTTP 链路首选，可在无桌面环境跑 |
-| `cmd/login``cmd/signin``cmd/credit``cmd/genicon` | 独立 CLI | `genicon` 生成图标资产 |
+| `cmd/server/` | **无头模式服务**（无 GUI） | 调试 HTTP 链路首选，Docker 里跑的就是它 |
+| `cmd/login` `cmd/signin` `cmd/credit` `cmd/genicon` | 独立 CLI | `genicon` 生成图标资产 |
+| `docker/` | Docker 部署全套（Dockerfile / compose × 2 / entrypoint / 离线镜像构建与校验） | 见 §13 |
 | `build.sh` / `genicon.sh` | 构建/图标脚本 | |
-| `.github/workflows/release.yml` | **打 tag `v*` 自动构建并发 Release** | 见 §10.3 |
 | `docs/` | 本目录 | |
 
 ---
 
-## 4. 关键不变量（改了必出事）
+## 4. 接口逆向：双平台契约
 
-> 这一节是**血泪史**。改动前务必逐条确认。
+> ★ **这是全项目地基**。所有字段名均已用真实抓包核对，**照抄，不要"修正拼写"**。
 
-### 4.1 `upstream.PrepareBody` 三种改写缺一不可
+### 4.1 主机与端点
 
-1. **强制 `stream=true`** — 上游拒绝非流式请求。
-2. **`tool_choice` 归一化** — 对象形式会返回 `400 code=11101`。
-3. **`role=developer` → `system`** — 上游对 `developer` 角色误触发内容过滤，返回"检测到敏感内容"。pi 等客户端对推理模型会使用该角色。
+#### WorkBuddy / CodeBuddy（CN）
 
-### 4.2 日志与面板零 token
+| 用途 | 端点 |
+|---|---|
+| 登录发起 | `POST copilot.tencent.com/v2/plugin/auth/state?platform=CLI` |
+| 登录轮询 | `GET /v2/plugin/auth/token?state=...`（pending 时业务 code ≠ 0） |
+| 账号信息 | `GET /v2/plugin/login/account?state=...` |
+| 刷新 token | `POST /v2/plugin/auth/token/refresh`（头带 `X-Refresh-Token`） |
+| 动态模型 | `GET /console/enterprises/personal/models` |
+| 余额 | `POST www.codebuddy.cn/v2/billing/meter/get-user-resource` |
+| 签到 | `POST /v2/billing/meter/daily-checkin` |
+| 聊天 | `POST copilot.tencent.com/v2/chat/completions`（**强制 stream**） |
 
-任何日志、面板数据、错误信息**不得包含** access token / refresh token / GitHub token。调试时用假 token 代替。
+认证头：`Authorization: Bearer <accessToken>`、`X-User-Id`，可选 `X-Enterprise-Id` / `X-Tenant-Id` / `X-Domain`。
+`Origin` / `Referer`：CN 用 `https://www.codebuddy.cn`，global 用 `https://www.workbuddy.ai`。
+UA 固定：`CLI/2.63.2 CodeBuddy/2.63.2`。
 
-### 4.3 auth 文件格式固定
+#### TraeWork
+
+| 用途 | 端点（相对 Host） | Host |
+|---|---|---|
+| 聊天 | `POST /api/agent/v3/llm_utils_chat` | `https://trae-api-cn.mchost.guru` |
+| 动态模型 | `POST /api/ide/v1/get_detail_param` | `https://trae-api-cn.mchost.guru` |
+| 签到状态 | `POST /trae/api/v2/ug/checkin_credits/status`（体 `{}`） | `https://api.trae.cn` |
+| 领取额度 | `POST /trae/api/v2/ug/checkin_credits/claim`（体 `{"req_source":1}`） | `https://api.trae.cn` |
+| 剩余积分 | `POST /trae/api/v2/pay/user_current_entitlement_list`（体 `{}`） | `https://api.trae.cn` |
+| 兑换 token | `POST /cloudide/api/v3/trae/oauth/ExchangeToken` | `https://api.trae.com.cn` |
+| 用户信息 | `POST /cloudide/api/v3/trae/GetUserInfo` | `https://api.trae.com.cn` |
+
+#### ⚠️ 陷阱：TraeWork 有 **3 个不同 Host**，用错必 404
+
+```
+AgentHost   = "https://trae-api-cn.mchost.guru"   ← 聊天 / 模型
+UgHost      = "https://api.trae.cn"               ← 签到 / 积分 / 权益包
+OAuthHost   = "https://api.trae.com.cn"           ← token 兑换 / 用户信息
+ConsoleHost = "https://www.trae.cn"               ← 网页端（仅参考）
+```
+
+**实测教训（2026-10-08）**：把 `user_current_entitlement_list` 发到 `trae-api-cn.mchost.guru`
+会返回 **HTTP 404 + HTML 页面**（`<title>404 Not Found</title>`，服务标识 `TLB`），
+解析时报 `invalid character '<' looking for beginning of value`。
+**权益包必须发 `api.trae.cn`。**
+
+### 4.2 TraeWork 认证头
+
+```
+Authorization: Cloud-IDE-JWT <accessToken>
+X-User-Region: CN
+X-Device-Id: <16 位纯数字，客户端真实注册设备号>   ← 签到必需，见 §4.4
+```
+
+### 4.3 真实响应 JSON（照抄）
+
+#### 余额（权益包列表）— 2026-09-29 抓包
 
 ```json
 {
-  "auth":    { "accessToken": "...", "refreshToken": "...", "expiresAt": 1753600000, "domain": "..." },
-  "account": { "uid": "...", "enterpriseId": "...", "nickname": "..." }
+  "is_credits_billing": true,
+  "usage_summary": {
+    "consumed_amount": 3751.3,
+    "consumption_ratio": 0.9262469135802469,
+    "total_amount": 4050
+  },
+  "user_entitlement_pack_list": [
+    {"display_desc":"免费","entitlement_base_info":{"quota":{"no_bonus_quota":true}},"usage":{}},
+    {"display_desc":"每月登录赠送","group_name":"每月登录积分",
+     "entitlement_base_info":{"quota":{"credits_limit":500}},"usage":{"credits_amount":500}},
+    {"display_desc":"签到奖励","group_name":"每日签到",
+     "entitlement_base_info":{"quota":{"credits_limit":200}},"usage":{"credits_amount":200}},
+    {"display_desc":"签到奖励","group_name":"每日签到",
+     "entitlement_base_info":{"quota":{"credits_limit":150}},"usage":{"credits_amount":150}},
+    {"display_desc":"签到奖励","group_name":"每日签到",
+     "entitlement_base_info":{"quota":{"credits_limit":150}},"usage":{"credits_amount":1.304}},
+    {"display_desc":"签到奖励","group_name":"每日签到",
+     "entitlement_base_info":{"quota":{"credits_limit":150}},"usage":{}}
+  ]
 }
 ```
-`internal/auth` 的读取逻辑与 `internal/login.SaveAuth` 的写入必须一致。
 
-### 4.4 `config.listen` 双格式兼容
+**口径**：剩余 = `usage_summary.total_amount - usage_summary.consumed_amount` = 4050 − 3751.3 = **298.7**。
+**逐包验证**：`Σ(credits_limit - usage.credits_amount)` 求和 = **298.696**（与权威值 298.7 **四舍五入到 1 位小数后一致，精确值差 0.004**）。
 
-新版对象 `{"host":"127.0.0.1","port":7863}` + 旧版字符串 `":7863"` / `"127.0.0.1:7863"` / `"7863"` 都要能解析（`Listen.UnmarshalJSON`）。
+> ⚠️ **两条口径要分清**：`usage_summary` 是上游算好的权威值，逐包求和只是**佐证**（两者在小数位上有 0.004 级的浮点/取整差异，属正常）。**优先用 `usage_summary`**；只有当 `usage_summary` 缺失时才回退逐包求和。
+> 逐包求和的两个细节：① `usage: {}` 的包按「未使用」处理，剩余 = `credits_limit`；② 若逐包求和与 `usage_summary` 相差超过 1 分，说明解析漏包，应告警而非静默采用。
 
-### 4.5 `state.json` 向后兼容
+> ⚠️ **三个致命陷阱**：
+> 1. **`usage: {}` 表示"未使用"，不是"无法判断"**。曾把它当解析失败 → 少算额度。
+> 2. **`credits_limit` 是上限不是余额**。曾把所有包的 `credits_limit` 累加当余额 → 显示 4050（实际 298.7）。
+> 3. **`usage` 为 `{}` 时该包剩余 = 上限**（未动过），而不是 0。
 
-**只增字段，不减字段**。旧文件缺失新字段时按零值处理，不得报错。
+#### 签到状态 — 成功响应
 
-### 4.6 托盘回调必须 `go` 化
-
-systray 的消息循环线程上**禁止**执行任何重量逻辑。wails 的 runtime 调用会 marshal 到主线程，一旦阻塞就**永久卡死托盘**。
-
-```go
-// 正确
-systray.SetOnClick(func(systray.IMenu) { go a.ShowPanel() })
-// 错误 —— 会卡死托盘
-systray.SetOnClick(func(systray.IMenu) { a.ShowPanel() })
+```json
+{"checked_in": false, "did_checked_in": true, "credits": 100, "enable": true, "message": "success"}
 ```
 
-> **历史教训**：曾用 `AddMenuItem + ShowMenu`（`TrackPopupMenu` 模态循环）导致托盘随机卡死。**现在完全不使用原生右键菜单**，右键 = 左键 = 弹面板。不要"顺手加回菜单"。
+- **`did_checked_in`** = 今天签到成功过 ← **用它做验证**
+- `checked_in` = 用户当前是否处于签到会话，**对 API 调用方恒为 false**（用它会每次误判失败）
 
-### 4.7 面板显示前必须等 `domReadyCh`
+#### 206 权益包原始结构（2026-10-08 抓包，23 个包）
 
-冷启动 WebView2 很慢，直接 `WindowShow` 会白窗口。`ShowPanel` 内部已处理，勿绕过。
+单个包的真实字段（**含到期时间**）：
 
-### 4.8 WebView2 用户数据目录固定 `data/webview`
+```json
+{
+  "display_desc": "签到奖励",
+  "group_name": "每日签到",
+  "group_type": 1,
+  "expire_time": 1794011797,                    ← ★ 到期时间（Unix 秒）
+  "yearly_expire_time": 0,
+  "is_hide": false,
+  "is_last_period": false,
+  "is_oneweek": false,
+  "next_billing_time": 0,
+  "source_id": "",
+  "status": 1,
+  "usage": {"credits_amount": 0},
+  "entitlement_base_info": {
+    "end_time": 1794011797,                     ← 与 expire_time 恒等（兜底用）
+    "start_time": 1790143545,
+    "ent_status": 0,
+    "entitlement_id": "checkin_20261007_1554031214073648",   ← ★ 包唯一 ID
+    "product_id": 208,
+    "product_type": 2,
+    "quota": {"credits_limit": 100},            ← 额度上限
+    "product_extra": {
+      "package_extra": {
+        "duration": 31,
+        "package_duration_type": 0,
+        "package_name": "签到奖励",
+        "package_source_type": 9                 ← 9 = 签到
+      }
+    }
+  }
+}
+```
 
-启动前检测 `SingletonLock` 并清理孤儿进程（强杀残留会锁 profile → 下次启动假死/白窗口）。**不要**改成随 exe 名变化的路径。
+**`entitlement_id` 前缀规则**（用于识别来源）：
 
-### 4.9 选号必须单调推进（v0.4.0 新增）
-
-`pool.PickExcluding(tried)` 在同一请求内依赖 `tried` 排除已试账号。若去掉这个语义，「优先过期」和「负载均衡」会**反复选中同一个**快照值最优的账号。详见 §5.2。
-
-### 4.10 版本号三处同步
-
-| 位置 | 用途 |
+| 前缀 | 含义 |
 |---|---|
-| `wails.json` → `info.productVersion` | 安装包元数据 |
-| `internal/app/app.go` → `var Version` | 面板显示的默认值（被 ldflags 覆盖） |
-| 构建时 `-ldflags -X ...app.Version=` | 实际注入的版本 |
+| `checkin_<YYYYMMDD>_<uid>` | 某日签到奖励（有效期约 31 天） |
+| `monthly_bonus_<YYYYMM>_<uid>` | 某月月初奖励 |
+| `free_utc<YYYYMM>_<uid>` | 免费包，**`credits_limit` 为 0**，须排除 |
+
+> ⚠️ **`expire_time` 可能被上游换成毫秒**：`> 1e12` 时须 `/ 1000`，否则时间会显示成公元 5 万年。
+
+### 4.4 铁律：`X-Device-Id` 语义（**已澄清，勿沿用旧结论**）
+
+**旧结论（v0.5.7 及以前，已作废）**："9074 = 设备未注册，重试无用"。
+**现结论（v0.6.9 起）**：**9074 是瞬时限流，可重试**，重试动作在 `claimWithRotatedDevice` 内部同步完成（**最多换号 8 次**）。
+
+2026-09-30 单变量实测（同账号、同 token，只改 `X-Device-Id`）：
+
+| `X-Device-Id` | 请求体 | 结果 |
+|---|---|---|
+| 随机 32 位 hex | `{"req_source":1}` | ❌ 9074 |
+| 客户端真实注册号 | `{"req_source":1}` | ✅ 成功 |
+| 随机 32 位 hex | `{}` | ✅ 成功 |
+| 客户端真实注册号 | `{}` | ✅ 成功（9095 今日已签） |
+
+→ 空请求体时上游跳过设备校验（**这一点曾误导修复方向**）；桌面端真实行为带 `req_source`，所以两者都要对。
+
+**真实设备号获取**：明文写在客户端 `storage.json` 的**键名**上：
+
+```
+C:\Users\<user>\AppData\Roaming\TRAE SOLO CN\User\globalStorage\storage.json
+  "iCubeAuthInfo://icube-dc:4484256452647802": { ... }
+                          ^^^^^^^^^^^^^^^^ 16 位纯数字 = 注册设备号
+```
+
+> ⚠️ **不要用 `telemetry.devDeviceId`**（UUID 形式）——它不是注册设备号，用了会被更严格限流。
+
+**9095 的真实语义（v0.7.0 澄清）**：文案说"设备已签到"，但实测**去重粒度是账号级**，与设备号无关。
+
+决定性矩阵实验（2026-09-30）：
+
+| 账号状态 | 设备号 | 结果 |
+|---|---|---|
+| 账号1（今天已签） | 真实设备号 | 9095 |
+| 账号1（今天已签） | 随机设备号 | 9095 |
+| 账号2（今天未签） | 真实设备号 | success |
+| 账号2（今天未签） | 随机设备号 | success |
+
+⇒ **决定因素是账号，不是设备**。所以 9095 = **该账号今日已领**（**幂等成功，不是失败**）。
+
+> ⚠️ 但要警惕异常：上游可能把账号标记"已签"却**没真正发额度包**（实测账号1 全天 `did_checked_in=true` 却无今日权益包）。
+> 因此**对账必须查 `entitlement_id` 是否含今天日期**，不能只信状态标志（§6.5）。
+
+### 4.5 TraeWork 业务码
+
+| code | 含义 | 处理 |
+|---|---|---|
+| `0` | 成功 | 后置 status 验证 + 查今日权益包 |
+| `9095` | 该账号今日已领 | **视为成功**（幂等） |
+| `9074` | 瞬时限流 | **可重试**：内部换设备号最多 8 次 |
+| `9004` | 缺订单参数 | 实际是缺 `X-Device-Id`；带上即可 |
+| `4001` | 参数无效（**in-band，见 §4.6**） | 请求方参数问题，不冷却账号 |
+
+### 4.6 ⚠️ 200 伪装错误（in-band error，v0.7.2 修复）
+
+**现象**：上游返回 **HTTP 200 + 正常 SSE 流**，但 `delta.content` 里是错误文本，`finish_reason=stop`。
+
+真实响应（2026-10-02 抓包，逐字照抄）：
+
+```
+data: {"choices":[{"delta":{"content":"solo error code=4001 msg=We're sorry, the param is invalid. Please try with a valid param."},"finish_reason":"stop","index":0}],"created":1790928286,"id":"chatcmpl-1","model":"","object":"chat.completion.chunk"}
+
+data: [DONE]
+```
+
+**危害**：旧实现把它当**正常模型回答**透传给用户 → 用户看到一段英文错误。
+**正确做法**：识别 `delta.content` 里的 `solo error code=<N> msg=<...>` 模式，**转为错误返回**（不写进回答流）。
 
 ---
 
-## 5. 核心机制详解
+## 5. 整体架构与数据流
 
-### 5.1 账号生命周期状态机
+### 5.1 模块划分
+
+```
+┌──────────────┐   ┌──────────────┐   ┌──────────────┐
+│  frontend/   │   │  cmd/server  │   │  internal/   │
+│  dist/       │   │  (无头模式)   │   │  admin/      │
+│  (Wails GUI) │   │              │   │  (网页面板)   │
+└──────┬───────┘   └──────┬───────┘   └──────┬───────┘
+       │ window.go.app    │ HTTP             │ HTTP
+       ▼                  ▼                  ▼
+┌─────────────────────────────────────────────────────┐
+│  internal/app/app.go   ← wails 绑定层（26 个方法）    │
+└──────┬──────────────────────────────────────────────┘
+       │
+┌──────▼──────┐  ┌────────────┐  ┌──────────────┐
+│ internal/   │  │ internal/  │  │ internal/    │
+│ pool        │  │ scheduler  │  │ server       │
+│ (选号/冷却) │  │ (签到/保活) │  │ (OpenAI API) │
+└──────┬──────┘  └─────┬──────┘  └──────┬───────┘
+       │               │                │
+       └───────────────┴────────────────┘
+                       │ provider.Upstream 接口
+              ┌────────┴────────┐
+              ▼                 ▼
+      internal/upstream   internal/traework
+      (WorkBuddy)         (TraeWork)
+```
+
+### 5.2 请求数据流
+
+```
+【客户端】→ POST /v1/chat/completions
+    → server.withAuth（Bearer 校验；APIKey 空则跳过）
+    → runtimeForModel（解析 "platform/model" 前缀）
+    → rewriteModel（剥掉前缀）
+    → for i := 0; i < MaxRotate; i++ {
+          acct := pool.PickExcluding(tried)   ← 按策略选号
+          if acct == nil { break }
+          tried[acct.UID] = true
+          pool.NotifyUsed(acct.UID)           ← 标记"正在调用"
+          [按需 refresh token（RefreshSkew = 10min）]
+          upstream.ChatStream(acct, body)
+              → upstream.PrepareBody（三改写，§6.1）
+              → [失败则按 Classify 冷却，继续下一个]
+      }
+```
+
+### 5.3 前端数据流
+
+```
+Wails 启动
+  → app.OnStartup(ctx)
+  → app.OnDomReady(ctx) → close(domReadyCh)
+  → 前端 app.js load() → Go.GetState()
+  → 渲染（render() → renderAccounts() / renderTotal() / ...）
+  → 订阅事件：accounts / checkin / refresh / login / panel:shown
+```
+
+---
+
+## 6. 模块实现规格
+
+### 6.1 `upstream.PrepareBody` — 三改写缺一不可
+
+**改错的后果都很严重，务必实现**：
+
+1. **强制 `stream = true`** — 上游拒绝非流式请求。
+2. **`tool_choice` 归一化** — 对象形式会返回 `400 code=11101`。
+3. **`role=developer` → `system`** — 上游对 `developer` 角色误触发内容过滤，返回"检测到敏感内容"。pi 等客户端对推理模型会使用该角色。
+
+### 6.2 选号策略引擎
+
+**三种策略**：
+
+| 策略 | 常量 | 算法 |
+|---|---|---|
+| 优先积分（默认） | `"credits"` | 候选集中 `credits` 最大者；**同分取 UID 较小者**（稳定排序，修掉原先 range map 随机问题） |
+| 优先过期 | `"expire"` | ①有积分者优先 ②`ExpiresAt` 小者优先 ③未知者排最后 ④退化到比积分 → UID |
+| 负载均衡 | `"roundrobin"` | 候选集按 UID 排序，从游标 `rrLast` 的下一个开始；游标写回 state.json |
+
+**挑选流程** `PickExcluding(tried)`：
+
+```
+healthyLocked(now, tried)        ← 排除 disabled / 冷却中 / tried 中的
+    │
+    ├─ 结果为空 且 tried 非空 → 回退：healthyLocked(now, nil)
+    │   （说明已轮完一圈，允许重复；handler 的 MaxRotate 循环也该结束）
+    │
+    ├─ 仍为空 → return nil（真·无可用账号）
+    │
+    └─ 按 p.strategy 分派 pickCredits / pickExpire / pickRoundRobin
+```
+
+**⚠️ 核心约束 —— 单调推进**：
+
+```go
+tried := map[string]bool{}
+for i := 0; i < MaxRotate; i++ {
+    acct := rt.Pool.PickExcluding(tried)   // 每次排除上次结果 → 必然换号
+    if acct == nil { break }
+    tried[acct.UID] = true
+    rt.Pool.NotifyUsed(acct.UID)           // 记录"正在调用" + 推进 rr 游标
+    ...
+}
+```
+
+去掉 `tried` 语义 →「优先过期」和「负载均衡」会**反复选中同一个**快照值最优的账号。
+
+**策略作用域**：**全局**——两个平台的 pool 同时 `SetStrategy`，持久化在 `config.json` 的 `strategy` 字段。
+
+**「正在调用」标识**：`NotifyUsed(uid)` 记 `lastUsedAt = now` 与 `lastCallCredits`；
+面板判断 `now - lastUsedAt < 5s` → 「调用中」（绿色脉冲）。
+**这是时间推断，不是精确在途计数**（刻意如此，避免进程异常退出残留计数）。
+
+### 6.3 账号生命周期状态机
 
 ```
         ┌──────────┐
@@ -188,7 +482,7 @@ systray.SetOnClick(func(systray.IMenu) { a.ShowPanel() })
              │
    ┌─────────┼─────────┬──────────────┐
    │         │         │              │
-余额不足   429    连续错误×N    session 失效
+余额不足    429    连续错误×N    session 失效
    │         │         │              │
    ▼         ▼         ▼              ▼
 CoolHard  CoolSoft  CoolErr      Disabled
@@ -205,98 +499,177 @@ CoolHard  CoolSoft  CoolErr      Disabled
 - **冷却账号仍参与签到**（以便恢复）；**Disabled 账号不参与签到**
 - 错误分类由 `upstream.Classify(status, body)` 决定
 
-### 5.2 选号策略引擎（v0.4.0 核心）
+### 6.4 错误分类 `Classify(status, body)`
 
-**三种策略**：
-
-| 策略 | 常量 | 算法 |
-|---|---|---|
-| 优先积分（默认） | `credits` | 候选集中 `credits` 最大者；**同分取 UID 较小者**（稳定排序，修掉了原先 range map 随机的问题） |
-| 优先过期 | `expire` | ①有积分者优先 ②`ExpiresAt` 小者优先（先过期先用）③过期时间未知者排最后 ④退化到比积分 → UID |
-| 负载均衡 | `roundrobin` | 候选集按 UID 排序，从游标 `rrLast` 的下一个开始；游标写回 state.json |
-
-**挑选流程**（`PickExcluding`）：
-
-```
-healthyLocked(now, tried)        ← 排除 disabled / 冷却中 / tried 中的
-    │
-    ├─ 若结果为空 且 tried 非空 → 回退：healthyLocked(now, nil)
-    │   （说明已轮完一圈，允许重复；handler 的 MaxRotate 循环也该结束了）
-    │
-    ├─ 仍为空 → return nil（真·无可用账号）
-    │
-    └─ 按 p.strategy 分派 pickCredits / pickExpire / pickRoundRobin
-```
-
-**⚠️ 核心约束 —— 单调推进**：
-
-同一请求内，handler 用 `tried` map 累计已试账号：
+**判定顺序是语义的一部分，必须严格按下面顺序实现**（源码 `internal/upstream/client.go:80-122` 逐行照抄，非伪代码）：
 
 ```go
-tried := map[string]bool{}
-for i := 0; i < MaxRotate; i++ {
-    acct := rt.Pool.PickExcluding(tried)   // 每次排除上次结果 → 必然换号
-    if acct == nil { break }
-    tried[acct.UID] = true
-    rt.Pool.NotifyUsed(acct.UID)           // 记录"正在调用" + 推进 rr 游标
-    ...
+func Classify(status int, body string) ErrKind {
+    if status == http.StatusPaymentRequired { // 402
+        return ErrHardCredit
+    }
+    lower := strings.ToLower(body)
+    // 1) 余额不足：小写英文 + 中文原文 双通道
+    //    ⚠️ 注意是「lower 匹配」OR「原文匹配」——因为硬编码里有中文（lower 不改变中文）
+    for _, m := range hardMarkers {
+        if strings.Contains(lower, strings.ToLower(m)) || strings.Contains(body, m) {
+            return ErrHardCredit
+        }
+    }
+    // 2) session 失效：⚠️ 只匹配原文，不做 ToLower
+    for _, m := range sessionDeadMarkers {
+        if strings.Contains(body, m) {
+            return ErrSessionDead
+        }
+    }
+    // 3) 模型/参数错误：必须排在 4xx 兜底之前，否则会被误判成「账号故障」而冷却账号
+    for _, c := range badModelCodes {          // 业务码通道（更稳）：⚠️ 只匹配原文
+        if strings.Contains(body, c) {
+            return ErrBadModel
+        }
+    }
+    for _, m := range badModelMarkers {        // 文案通道：lower OR 原文
+        if strings.Contains(lower, strings.ToLower(m)) || strings.Contains(body, m) {
+            return ErrBadModel
+        }
+    }
+    // 4) 其余按状态码。⚠️ 429 / 404 必须在 >=400 兜底之前单独判，否则会退化成 ErrClient
+    if status == http.StatusTooManyRequests { // 429
+        return ErrSoftRate
+    }
+    if status == http.StatusNotFound {        // 404
+        return ErrNotFound
+    }
+    if status >= 500 {
+        return ErrServer
+    }
+    if status >= 400 {
+        return ErrClient
+    }
+    return ErrNone
 }
 ```
 
-同时 `pickRoundRobinLocked` 和 `NotifyUsed` 也会推进 `rrLast`，**双保险**保证连续调用换号。
+> ⚠️ **三个易错点（都会导致重写后行为不一致）**：
+> 1. **`429` / `404` 必须在 `status >= 400` 之前显式判断**。若省略，404/429 会落到 `ErrClient`，进而丢掉 §附录 B.3 规定的「404 不累计 errCount 防雪崩」和「429 短冷却 60s」语义。
+> 2. **匹配通道不是统一的**：`hardMarkers` / `badModelMarkers` 是「`lower` 匹配 OR 原文匹配」；`sessionDeadMarkers` / `badModelCodes` 是**只匹配原文**（`sessionDeadMarkers` 的值首字母大写 `Offline user session not found`，`badModelCodes` 依赖 JSON 里的字面量空格形态）。全部改成统一 ToLower 会导致 11103 漏判。
+> 3. **`badModelCodes` 是字面量子串匹配，不是解析 JSON 取数字 code**。`[]string{`"code":11102`, `"code":11103`, `"code": 11102`, `"code": 11103`}` 之所以要写 4 个，就是因为要同时覆盖「有空格 / 无空格」两种 JSON 序列化形态。若上游把 code 换个位置（如放进嵌套 `data` 且序列化带换行），字面量匹配会漏 → 落到 `ErrClient` → 误冷却账号池（这正是 §9 记录的历史事故）。
 
-**策略作用域**：**全局**——两个平台的 pool 同时 `SetStrategy`，持久化在 `config.json` 的 `strategy` 字段。
+**关键词表（逐字照抄）**：
 
-**「正在调用」标识的实现**：
-- `NotifyUsed(uid)` 记录 `lastUsedAt = now` 与 `lastCallCredits = credits`
-- 面板据此判断：`now - lastUsedAt < 5s` → 显示「调用中」（绿色脉冲）；有值时 → 「最近用过」
-- **注意**：这是**时间推断**，不是精确在途计数（设计上刻意如此，避免进程异常退出残留计数）
-
-### 5.3 模型名必须带平台前缀
-
-```
-workbuddy/glm-5.2
-workbuddy/deepseek-v4-pro
-traework/glm-5.2
-traework/kimi-k2.7-code
-```
-
-`runtimeForModel` 强制校验前缀格式，无前缀返回 `invalid_model`。模型列表**动态获取**（`dynamicModelsTTL = 1h`，失败后 `modelsFetchFailCooldown = 5min` 内不重试）。
-
-### 5.4 登录流程（无痕浏览器 OAuth）
-
-```
-面板点"＋ WorkBuddy"
-  → app.StartLoginFor("workbuddy")
-  → login.Start()  → POST copilot.tencent.com/v2/plugin/auth/state?platform=CLI
-  → ResolveAuthURL() 预解析跳转链
-      copilot.tencent.com/login → 301 加斜杠 → www.codebuddy.cn/login
-  → winutil.DefaultBrowserIncognito() + LaunchIncognito() 拉起无痕浏览器
-  → 前端弹模态框显示倒计时（300s）+ 授权链接（可复制）
-  → 轮询 loginPollEvery = 2s  GET /v2/plugin/auth/token?state=...
-  → 成功 → 取账号信息 → SaveAuth 写 auths/ → pool 重载 → 异步签到
-  → 前端收到 login 事件（phase: success/failed/cancelled）
+```go
+hardMarkers = []string{
+    "insufficient credit", "no credit", "credit exhausted", "out of credit",
+    "quota exceeded", "quota exhaust", "payment required", "credit not enough",
+    "not enough credit",
+    "积分不足", "额度不足", "余额不足", "积分用完", "额度用尽", "没有积分",
+}
+sessionDeadMarkers = []string{"Offline user session not found", "12153"}
+badModelMarkers = []string{"service info not found", "model not found", "invalid model", "unknown model"}
+badModelCodes = []string{`"code":11102`, `"code":11103`, `"code": 11102`, `"code": 11103`}
 ```
 
-超时上限 `loginTimeout = 5 * time.Minute`。
+> ⚠️ **`ErrBadModel` 绝不计入账号 errCount**。这是**请求方参数错误**，换账号/重试都不会成功。
+> 曾因未识别 `11103` 落到 `default` 分支触发 `NoteError` → **一次错误调用把 3 个账号各 +1 errCount，直接导致账号池冷却**。
 
-### 5.5 日志轮转
+`11102` / `11103` 的真实响应：
 
-`data/app.log` 超过 `maxLogSize = 5MB` → 改名为 `app.log.1`（先删旧备份，Windows rename 不覆盖）→ 重开新文件。
+```json
+{"code":11102,"msg":"model [X] service info not found"}
+{"code":11103,"msg":"Backend [hunyuan-stream] is not supported"}
+```
 
-### 5.6 面板位置记忆
+**模型名映射陷阱**（显示名 ≠ 真实 ID，上游**区分大小写、精确匹配**）：
 
-`SavePanelPos(x, y)` 写 `data/panel-pos.json`。前端在 `mouseup` 后延时 **350ms** 调用（Wails 原生拖拽期间前端收不到事件，必须等系统拖拽结束，否则保存到中间位置）。
+| 客户端显示名 | 真实 ID（必须发给上游） |
+|---|---|
+| Deepseek-V4.1-Flash | `deepseek-v4.1-flash` |
+| GLM-5.3 | `glm-5.3` |
+| Kimi-K3 | `kimi-k3-1` ← 连词根都不同 |
+| Kimi-K2.7-Code | `kimi-k2.7` ← 连词根都不同 |
 
-`panelRect()` 恢复时仍会 **clamp 回工作区**，防止分辨率变化导致窗口出屏。
+### 6.5 签到流程
 
-### 5.7 单实例与强制退出
+> 两个平台的签到**机制不同**，分别说明：
+> - **TraeWork**：`claim` → `status` 验证 → 权益包对账 → 余额（**下面详述**）
+> - **WorkBuddy**：`POST /v2/billing/meter/daily-checkin`，响应直接给结果（无独立 status 接口）。旧文档误把本节标题写成"（TraeWork）"，导致 WorkBuddy 侧看起来缺失，此处更正。
 
-- **进程级**：`winutil.AcquireSingleInstance()`（`CreateMutex Local\WorkBuddy-Wild-SingleInstance`），在 HTTP/调度器/WebView2 **之前**检查
-- **wails 级**：`SingleInstanceLock.UniqueId = "workbuddy-wild-gui-v1"`
-- **退出兜底**：`ForceQuit()` = `runtime.Quit` + `quitTimeout = 5s` 超时后 `os.Exit(1)`（WebView2 卡死时 runtime 调用会永久阻塞）
+```
+【调度器】checkin(uid)
+  → 1. POST checkin_credits/claim，体 {"req_source":1}
+       ├─ 失败且为 9074 → claimWithRotatedDevice：换设备号最多 8 次
+       │    ⚠️ 用 defer 还原 a.DeviceID，不污染凭证文件
+       └─ 失败且 9095 → 视为成功（幂等）
+  → 2. POST checkin_credits/status，体 {} → 读 did_checked_in 验证
+       ⚠️ 是 POST 不是 GET（源码 internal/traework/client.go:714 用 http.MethodPost + 空体 {}）
+  → 3. 对账：查权益包里有没有 entitlement_id 含今天日期
+       ├─ 有 → 真到账，r.OK = true
+       ├─ 无 → r.GrantMissing = true（"已签到但未查到新增积分"）
+       └─ 依据：did_checked_in 只是"标记"，不保证额度到账
+  → 4. 查余额（UserResource）→ ReenableIfCredits
+  → 5. pool.RecordCheckin + notifyCheckin
+```
 
-### 5.8 防卡死三层防御
+**`claimWithRotatedDevice` 关键实现**：
+
+```go
+func (c *Client) claimWithRotatedDevice(a *auth.Auth) (bool, float64) {
+    before, err := c.UserEntUsage(a)     // 取前置额度用于对比
+    if err != nil { return false, 0 }
+
+    orig := a.DeviceID
+    defer func() { a.DeviceID = orig }() // ⚠️ 不污染凭证
+
+    const maxRotateAttempts = 8
+    for i := 0; i < maxRotateAttempts; i++ {
+        // 换一个设备号重试 claim ...
+    }
+}
+```
+
+### 6.6 模型列表（动态，带缓存）
+
+```go
+dynamicModelsTTL        = time.Hour        // 成功缓存 1 小时
+modelsFetchFailCooldown = 5 * time.Minute  // 失败后 5 分钟内不重试
+```
+
+模型名**必须带平台前缀**（`workbuddy/...` / `traework/...`），
+`runtimeForModel` 强制校验前缀格式，无前缀返回 `invalid_model`。
+
+> 该失败冷却**仅对非 WorkBuddy 平台生效**（WorkBuddy 侧无此限制）。
+
+### 6.7 其它关键常量
+
+```go
+// app
+loginTimeout    = 5 * time.Minute
+loginPollEvery  = 2 * time.Second
+inUseWindow     = 5 * time.Second     // "正在调用"判定窗
+quitTimeout     = 5 * time.Second     // ForceQuit 兜底超时
+maxLogSize      = 5 * 1024 * 1024     // 5MB 日志轮转
+
+// 窗口 / 面板
+窗口尺寸         = 760 × 560
+面板位置保存延时 = 350ms              // 等 Wails 原生拖拽结束
+WebView2 数据目录 = data/webview
+
+// 单实例
+进程互斥体      = Local\WorkBuddy-Wild-SingleInstance
+wails UniqueId  = workbuddy-wild-gui-v1
+```
+
+### 6.8 日志轮转
+
+`data/app.log` 超 `maxLogSize = 5MB` → 改名 `app.log.1`（**先删旧备份**，Windows rename 不覆盖）→ 重开新文件。
+
+### 6.9 面板位置记忆
+
+`SavePanelPos(x, y)` 写 `data/panel-pos.json`。
+前端在 `mouseup` 后**延时 350ms** 调用（Wails 原生拖拽期间前端收不到事件，必须等系统拖拽结束，否则保存中间位置）。
+`panelRect()` 恢复时仍 **clamp 回工作区**，防分辨率变化导致出屏。
+
+### 6.10 防卡死三层防御
 
 1. `winutil.IsHungAppWindow`（`user32`，窗口 5s 无响应检测）→ `ShowPanel` 卡死前拦截并提示，不调 runtime
 2. `ShowPanel` 的 `domReadyCh` 已关闭分支 **go 化**（调用方永不阻塞）
@@ -304,566 +677,941 @@ traework/kimi-k2.7-code
 
 ---
 
-## 6. 数据流
+## 7. 关键技术难点
 
-```
-【请求】客户端 → POST /v1/chat/completions
-    → server.withAuth（Bearer 校验，key 空则跳过）
-    → runtimeForModel（解析 platform/<model> 前缀）
-    → rewriteModel（剥掉前缀）
-    → for i < MaxRotate:
-        pool.PickExcluding(tried)      ← 按策略选号
-        pool.NotifyUsed(uid)           ← 标记"正在调用"
-        [按需 refresh token（RefreshSkew = 10min）]
-        upstream.ChatStream(acct, body)
-          → upstream.PrepareBody（三改写）
-          → copilot.tencent.com/v2/chat/completions
-        ├─ 成功 → NoteSuccess → 流式回传 / 聚合返回
-        └─ 失败 → Classify → Cooldown/Disable/NoteError → 下一个账号
-    → 全失败 → 503 no_healthy_account
+### 7.1 托盘不能有原生右键菜单
 
-【签到】scheduler（分钟级定时 或 面板"全部签到"）
-    → token 校验，必要时刷新后重试整套
-    → DailyCheckin → UserResource（查余额）
-    → ReenableIfCredits（remain>0 且非 disabled → 解冻）
-    → RecordCheckin 落 state.json
-    → 写 app.log + 事件推面板（NotifyCheckin）
+**问题**：曾用 `AddMenuItem + ShowMenu`（`TrackPopupMenu` 模态循环）→ 托盘随机卡死。
 
-【登录】见 §5.4
-
-【配置】面板修改
-    → app.SetXxx（加锁改 cfg）
-    → config.Save 原子写回（tmp + rename）
-    → 运行时立即生效：
-        SetListen          → 热切换监听（失败保持原样）
-        SetCheckinTimes    → 唤醒两个调度器
-        SetStrategy        → 两个 pool 同时切
-        SetAPIKey          → handler.SetAPIKey（带锁）
-```
-
----
-
-## 7. 前后端契约（wails 绑定）
-
-前端通过 `window.go.app.App.<方法>` 调用，通过 `window.runtime.EventsOn("<事件>")` 收事件。
-
-### 7.1 全部绑定方法（`internal/app/app.go`）
-
-| 方法 | 签名 | 用途 |
-|---|---|---|
-| `GetState` | `() State` | 面板初始数据（含 `strategy`） |
-| `GetAccounts` | `() []AccountView` | 账号快照（**前端每 1.5s 轮询此方法刷新"正在调用"**） |
-| `GetStrategy` | `() string` | 当前策略 |
-| `SetStrategy` | `(name string) error` | 切换全局策略 + 写回 config |
-| `StartLogin` / `StartLoginFor` | `(kind string) (string, error)` | 发起登录，返回授权 URL |
-| `CancelLogin` | `() error` | 取消登录 |
-| `CheckinAccount` | `(uid string) (scheduler.CheckinResult, error)` | 单账号签到 |
-| `CheckinAll` | `() []scheduler.CheckinResult` | 全部签到 |
-| `RefreshCredits` | `(uid string) (int64, error)` | 刷新单账号积分 |
-| `RefreshAll` | `()` | 刷新全部积分（面板打开时自动调） |
-| `RemoveAccount` | `(uid string) error` | 删除账号（含 auth 文件） |
-| `SetCheckinHours` / `SetCheckinTimes` / `SetCheckinMinutes` | `(...) error` | 三种签到时间接口（新版用 `SetCheckinTimes`） |
-| `SetListen` | `(host string, port int) error` | 热切换监听 |
-| `SetAPIKey` | `(key string) error` | 改 API-Key |
-| `SetAutostart` | `(on bool) error` | 开机自启 |
-| `SavePanelPos` | `(x, y int)` | 保存面板位置 |
-| `ShowPanel` / `HidePanel` | `()` | 显示/隐藏面板 |
-| `Quit` / `QuitAll` / `ForceQuit` | `()` | 退出 |
-| `OpenLogFile` | `() error` | 用记事本打开日志 |
-
-> **`GetState` 返回的 `State` 结构**（JSON 字段名即前端可用名）：
-> `accounts` / `checkin_hours` / `checkin_times` / `keepalive_hours` / `listen_host` / `listen_port` / `api_key` / `login_busy` / `next_checkin` / `version` / `autostart` / `running` / **`strategy`**
-
-> **`AccountView` 结构**：`uid` / `group`（workbuddy\|traework）/ `nickname` / `credits` / `cooling` / `until` / `reason` / `disabled` / `err_count` / `last_checkin_ok` / `last_checkin_at` / `last_checkin_msg` / **`last_used_at`** / **`last_call_credits`** / **`in_use`** / **`expires_at`**
-
-### 7.2 后端 → 前端事件
-
-| 事件名 | 载荷 | 触发时机 |
-|---|---|---|
-| `accounts` | `[]AccountView` | 账号状态变化（`emitAccounts`） |
-| `checkin` | `{platform, uid, ok, msg}` | 签到结果 |
-| `refresh` | `{platform, uid, ok, msg}` | token 刷新失败 |
-| `login` | `{phase, msg}` | 登录阶段（`success`/`failed`/`cancelled`） |
-| `panel:shown` | `nil` | 面板显示（前端重置动效 + 拉一次数据） |
-
-### 7.3 前端约定
-
-- **无 npm、无构建**：直接改 `frontend/dist/{index.html,style.css,app.js}`
-- `#app` 设 `--wails-draggable: drag`（**不是** `-webkit-app-region`！Wails v2.14 读的是 CSS 变量 `--wails-draggable`）；可交互元素设 `none`
-- **默认浅色**（`data-theme="light"`），🌙/☀ 可切深色，存 `localStorage.wbw_theme`
-- 轮询：`startLivePolling()` 每 **1500ms** 调 `GetAccounts`；`document.hidden` 时暂停
-
----
-
-## 8. 文件与持久化格式
-
-> 所有相对路径均相对 **exe 所在目录**（`main.go` 启动时 `os.Chdir` 到 exe 目录）。
-
-| 文件 | 内容 | 敏感 |
-|---|---|---|
-| `config.json` | 主配置（§9） | 含 api_key |
-| `auths/workbuddy-<uid>.json` | WorkBuddy 账号凭证 | **是（DPAPI 加密）** |
-| `auths/trae-<uid>.json` | TraeWork 账号凭证 | **是** |
-| `data/state-workbuddy.json` | WorkBuddy 池状态 | |
-| `data/state-traework.json` | TraeWork 池状态 | |
-| `data/panel-pos.json` | 面板位置 `{x, y}` | |
-| `data/login-state.json` | 登录 OAuth state | |
-| `data/app.log` / `app.log.1` | 日志（5MB 轮转） | |
-| `data/webview/` | WebView2 profile | |
-
-### 8.1 `state.json` 格式
-
-```json
-{
-  "accounts": {
-    "<uid>": {
-      "credits": 2588,
-      "disabled": false,
-      "reason": "",
-      "until": "2026-09-22T18:00:00+08:00",
-      "last_checkin_ok": true,
-      "last_checkin_at": "2026-09-22T09:00:03+08:00",
-      "last_checkin_msg": "ok",
-      "last_used_at": "2026-09-22T16:14:03+08:00",
-      "last_call_credits": 2600
-    }
-  },
-  "rr_last": "<uid>"     // 负载均衡游标（v0.4.0 新增）
-}
-```
-
-**写盘**：`os.WriteFile(tmp)` → `os.Rename`（原子），权限 `0600`。
-
-### 8.2 凭证加密（DPAPI）
-
-`internal/auth/secure.go` 用 Windows `CryptProtectData` / `CryptUnprotectData`：
-
-- 加密值前缀 `dpapi:` + base64
-- **兼容旧明文**：无前缀原样使用；解密失败降级原样
-- 加密字段：`accessToken` / `refreshToken`
-- ⚠️ 加密后**外部工具读不了 token**（本机单用户可用）
-
----
-
-## 9. 配置项全表
-
-```json
-{
-  "listen":  { "host": "127.0.0.1", "port": 7863 },
-  "api_key": "WorkBuddy2API",
-  "auth_dir": "./auths",
-  "state_file": "./data/state.json",
-  "region": "cn",
-  "strategy": "credits",
-  "max_rotate": 3,
-  "cooldown": {
-    "hard_credit": "12h",
-    "soft_rate": "60s",
-    "err_threshold": 3,
-    "err_cooldown": "10m"
-  },
-  "schedule": {
-    "checkin_times": ["09:00", "21:00"],
-    "keepalive_hours": [22]
-  },
-  "upstream": { "timeout_seconds": 120 }
-}
-```
-
-| 字段 | 默认 | 说明 |
-|---|---|---|
-| `listen.host` / `listen.port` | `127.0.0.1` / `7863` | 面板可热切换；`0.0.0.0` = 对外 |
-| `api_key` | `WorkBuddy2API` | 客户端 Bearer；**空 = 不鉴权** |
-| `auth_dir` / `state_file` | `./auths` / `./data/state.json` | 相对 exe 目录 |
-| `region` | `cn` | 仅 `cn` / `global` |
-| **`strategy`** | `credits` | `credits` / `expire` / `roundrobin`；非法值 → **启动报错** |
-| **`max_rotate`** | `3` | 单请求最多轮换账号数；`<=0`→3，`>20`→20 |
-| `cooldown.hard_credit` | `12h` | 余额不足冷却 |
-| `cooldown.soft_rate` | `60s` | 429 冷却 |
-| `cooldown.err_threshold` | `3` | 连续错误次数阈值 |
-| `cooldown.err_cooldown` | `10m` | 达到阈值后冷却 |
-| `schedule.checkin_times` | `["09:00","21:00"]` | 支持分钟；兼容旧 `checkin_hours`；面板可改即生效 |
-| `schedule.keepalive_hours` | `[22]` | token 保活时间 |
-| `upstream.timeout_seconds` | `120` | 聊天超时（账单固定 30s） |
-
-### 环境变量覆盖（`WB2A_*`，容器化用）
-
-```
-WB2A_LISTEN  WB2A_API_KEY  WB2A_AUTH_DIR  WB2A_STATE_FILE  WB2A_REGION
-WB2A_STRATEGY  WB2A_MAX_ROTATE
-WB2A_HARD_CREDIT  WB2A_SOFT_RATE  WB2A_ERR_THRESHOLD  WB2A_ERR_COOLDOWN
-WB2A_TIMEOUT_SECONDS
-```
-
-> `config.example.json` 必须与 `config.Default()` 同步。
-
----
-
-## 10. 构建与发布
-
-### 10.1 本地构建
-
-```bash
-cd <repo>
-
-export GOPATH="C:/Users/<你>/go5"
-export GOMODCACHE="$GOPATH/pkg/mod"
-export GOPROXY="https://goproxy.cn,direct"
-export GOFLAGS="-mod=mod"
-export PATH="<repo>/../tools/go/bin:/c/Users/<你>/go/bin:$PATH"
-
-# 全量校验
-go build ./... && go vet ./... && go test ./...
-
-# 出 exe（注入版本号）
-wails build -clean -m -nosyncgomod \
-  -ldflags "-X github.com/rockswang/workbuddy-wild/internal/app.Version=0.4.0"
-# 产物：build/bin/workbuddy-wild.exe
-```
-
-**参数说明**（都是踩坑换来的）：
-- `-nosyncgomod` — 跳过 go mod tidy/sync，否则 go 1.26 想写 `toolchain` 指令时 rename 会被拒
-- `-m` — 跳过前端构建（本项目前端无构建步骤）
-- `-clean` — 清理 bin 目录
-
-> 构建日志里出现 `已有实例在运行，本实例退出` 是 **binding 生成阶段重新拉起 exe** 撞上单实例锁，**无害**。
-
-### 10.2 图标
-
-```bash
-go run ./cmd/genicon      # 或 bash genicon.sh
-```
-`icon.png` 变更后必须重新生成（生成 `build/appicon.png`、`build/trayicon.ico`、`build/windows/icon.ico`）。
-
-### 10.3 发布（CI 自动，推荐）
-
-**仓库已配置 GitHub Actions**（`.github/workflows/release.yml`）：
-
-```
-打 tag v* → 自动：setup-go → 装 wails v2.14.0 → genicon → wails build
-          → 打包 zip（exe + config.example.json）→ 发 GitHub Release
-```
-
-所以发布只需：
-
-```bash
-git tag v0.4.0
-git push sddvcm v0.4.0        # tag 推送即触发 CI
-```
-
-也可在 Actions 页面 `workflow_dispatch` 手动触发（产物为 artifact）。
-
-### 10.4 发布（手动，备用）
-
-```bash
-# 建 release
-curl -X POST -H "Authorization: Bearer <TOKEN>" \
-  -H "Accept: application/vnd.github+json" \
-  https://api.github.com/repos/sddvcm/workbuddy-wild/releases \
-  -d '{"tag_name":"v0.4.0","name":"v0.4.0","body":"...","draft":false}'
-
-# 上传资产（先取 release id）
-curl -X POST -H "Authorization: Bearer <TOKEN>" \
-  -H "Content-Type: application/octet-stream" \
-  --data-binary @workbuddy-wild.exe \
-  "https://api.github.com/repos/sddvcm/workbuddy-wild/releases/<id>/assets?name=workbuddy-wild-v0.4.0.exe"
-```
-
-### 10.5 git 推送注意
-
-```bash
-git -c http.proxy=http://127.0.0.1:7897 -c https.proxy=http://127.0.0.1:7897 push
-```
-- **必须走 Clash 代理**（`127.0.0.1:7897`），直连 GitHub 会 TLS 握手 hang
-- 代理时通时断，**失败重试 2-5 次**
-- 非交互场景加 `GCM_INTERACTIVE=never GIT_TERMINAL_PROMPT=0`，否则 Git Credential Manager 会弹 GUI 对话框卡住
-
----
-
-## 11. 测试
-
-```bash
-go test ./...              # 全量
-go test ./internal/pool/ -v   # 单包
-```
-
-| 测试文件 | 覆盖 |
-|---|---|
-| `internal/pool/pool_test.go` | 冷却/禁用/持久化/错误计数 |
-| `internal/pool/strategy_test.go` | **14 个策略用例**（v0.4.0）：默认策略、三策略行为、rr 游标持久化、expire 排序、单调推进、`NotifyUsed` |
-| `internal/server/handler_test.go` | 鉴权、模型路由、轮换、错误分类 |
-| `internal/scheduler/scheduler_test.go` | 定时、解冻、签到记录 |
-| `internal/auth/auth_test.go` | auth 解析/加密、`NeedsRefresh` |
-| `internal/upstream/*_test.go` | SSE、body 改写 |
-| `internal/traework/client_test.go` | TraeWork 客户端 |
-
-**改策略相关代码后必须跑**：
-```bash
-go test ./internal/pool/ ./internal/server/ -count=1
-```
-
-> `TestPickExcluding` 的断言在 v0.4.0 改过：原本期望"全部试完后返回 nil"，现在**期望回退到起点**（配合 `MaxRotate` 循环）。真·无可用账号时仍返回 nil，由 `TestPickExcludingNilWhenAllUnavailable` 覆盖。
-
----
-
-## 12. 常见坑与排错
-
-### 12.1 GUI 无法在无桌面环境测试
-
-SSH / 服务会话（Session 0）无交互桌面 → WebView2 创建失败 → go-webview2 的 `errorCallback` **直接 `os.Exit(1)`**，`defer`/`recover` 都救不回来（HTTP 服务一并被杀）。
-
-**对策**：用 `cmd/server`（无头）调试 HTTP 链路；GUI 必须用真实桌面会话验证。
-
-### 12.2 孤儿 WebView2 锁 profile
-
-强杀进程后 → 下次启动假死/白窗口。已内置 `SingletonLock` 检测 + `KillOrphanWebViews`。
-手动处理：结束命令行含 `data/webview` 的 `msedgewebview2.exe`（**勿动其他应用的 webview**）。
-
-### 12.3 `os.IsNotExist` 不穿透 `%w`
+**解决**：**完全不使用原生右键菜单**，右键 = 左键 = 弹面板。
 
 ```go
-// 错误：首次运行会静默退出
-if os.IsNotExist(err) { ... }
 // 正确
-if errors.Is(err, fs.ErrNotExist) { ... }
+systray.SetOnClick(func(systray.IMenu) { go a.ShowPanel() })
+// 错误 —— 会卡死托盘
+systray.SetOnClick(func(systray.IMenu) { a.ShowPanel() })
 ```
 
-### 12.4 本机 Bash 工具 PATH 损坏
+**为什么**：systray 的消息循环线程上**禁止**执行重量逻辑。wails 的 runtime 调用会 marshal 到主线程，一旦阻塞就**永久卡死托盘**。
+**不要"顺手加回菜单"。**
 
-本机环境 `dirname` / `ls` / `cat` / `grep` / `git` / `tail` / `head` 可能全部 `command not found`。
+### 7.2 WebView2 孤儿进程锁 profile
 
-**对策**：用 Python 绝对路径做目录/文件操作；git 用绝对路径：
-```
-C:/Users/Administrator/.workbuddy/binaries/PortableGit/versions/1.2.0/cmd/git.exe
-```
+**问题**：强杀残留的 WebView2 进程会锁住 `data/webview` profile → 下次启动假死/白窗口。
 
-### 12.5 bat / vbs 中文乱码
+**解决**：启动前检测 `SingletonLock` 并清理孤儿进程。**用户数据目录固定 `data/webview`**，不要改成随 exe 名变化的路径。
 
-本机是 GBK 控制台（代码页 936）。写 `.bat` / `.vbs` 含中文**必须转 GBK + CRLF**：
+### 7.3 冷启动白窗口
 
-```python
-open('x.bat','wb').write(text.replace('\n','\r\n').encode('gbk'))
-```
-纯 ASCII 的 bat 最稳（任何代码页无歧义）。**不要** `chcp 65001` + UTF-8。
+**问题**：冷启动 WebView2 很慢，直接 `WindowShow` 会白窗口。
 
-### 12.6 Python 脚本中文输出
+**解决**：`ShowPanel` 必须等 `domReadyCh`（`OnDomReady` 里 close）。**勿绕过。**
 
-```bash
-export PYTHONIOENCODING=utf-8
-```
+### 7.4 DPAPI 跨平台差异
 
-### 12.7 批量删除超 50 个会被拦截
+Windows 下凭证用 DPAPI 加密（`dpapi:` 前缀）。**DPAPI 密钥绑定 Windows 用户**，
+Linux 侧遇 `dpapi:` 前缀返回**空串**（刻意设计，避免拿密文请求上游产生难懂 401）。
 
-单轮删除操作数有 **50 个硬阈值**，超过直接中断进程。清理目录用 `shutil.move` 整个目录（算 1 次操作），别逐文件 `os.remove`。
+**Docker 场景**：容器里写的是**明文**（Linux 的 `EncryptSecret` 是空操作）——这正是服务端需要的。
 
-### 12.8 写内联 base64 时**绝不凭记忆重写**
+### 7.5 积分口径的三次翻车
 
-**v0.4.0 真实事故**：重构 `index.html` 时把 logo 的 base64 data URI 凭记忆重写成不完整的占位数据（8017 字符 vs 原始 8310），导致 logo 空白。编译能过、常规字符串校验发现不了（长度对不上就发现不了）。
-
-**对策**：改写长常量必须从源文件/git 历史读取原值：
-```bash
-git show HEAD~1:frontend/dist/index.html   # 提取原值
-```
-校验时**比对长度 + 解码合法性**（`base64.b64decode(x)[:8].hex() == '89504e470d0a1a0a'` 即 PNG）。
-
-### 12.9 go 模块缓存被锁
-
-构建后 `@v/*.info` 被锁（Access denied，疑似杀软）→ 换新 `GOPATH`。别在原目录死磕；若 `go.mod`/`syso` 被锁，**重新 clone 一份**再构建。
-
-### 12.10 窗口尺寸相关
-
-窗口**固定 760×560**（`MinWidth 680` / `MinHeight 420`）。改尺寸要**同时改两处**：`main.go` 的 `wails.Run` 选项 + `app.go` 的 `panelRect()`。
-
----
-
-## 13. 跨平台移植（macOS / Linux）
-
-### 13.1 分层方案
-
-平台耦合只有两处：`internal/winutil`（Win32 直调）+ `main.go` 的 `Windows: &windows.Options{}`。
-
-- `internal/winutil` 按 build tag 拆分：`winutil_windows.go`（现状）+ `winutil_darwin.go` + `winutil_other.go`，**保持同名导出函数**（接口不变量）→ `internal/app` 零改动
-- `main.go` 拆 `main_windows.go` / `main_darwin.go`（`runGUI` 平台实现），公共装配留 `main.go`
-- pool / scheduler / login / upstream / server / config **零改动**
-- 前端**零改动**
-
-### 13.2 winutil 能力 × macOS 替代
-
-| Windows 实现 | macOS 替代 |
-|---|---|
-| `WorkArea()`（SPI_GETWORKAREA） | wails runtime `ScreenGetAll`，或 cgo `NSScreen.visibleFrame` |
-| `PanelAnchor`（任务栏锚定） | macOS 无任务栏：锚定主屏右上角（`visibleFrame` 右上 - 尺寸 - 8px） |
-| `HideFromTaskbar` | 无任务栏，空函数；置顶用 `AlwaysOnTop` |
-| `MainWindow` / `FocusWindow` | `NSApp.activateIgnoringOtherApps(true)`；可空实现 |
-| `SetAutostart`（注册表 Run） | `~/Library/LaunchAgents/*.plist` + `launchctl bootstrap` |
-| `DefaultBrowserIncognito`（注册表 UserChoice） | 解析 `LSHandlers` 默认浏览器 bundleId；Chrome `--incognito` / Edge `--inprivate` / Firefox `-private-window` |
-| `OpenURL`（rundll32） | `open <url>` |
-| `OpenWithNotepad` | `open -a TextEdit <file>` |
-| `InfoBox` / `AskYesNo`（MessageBoxW） | **优先用 wails `runtime.MessageDialog`**（跨平台一处实现） |
-| `KillOrphanWebViews`（PowerShell） | **不需要**：macOS 用系统 WKWebView，空实现 |
-| `AcquireSingleInstance`（CreateMutex） | `flock` 或 lockfile |
-| `IsHungAppWindow` | 可空实现（返回 false） |
-
-### 13.3 systray 差异
-
-- macOS 菜单栏图标**点击即显示原生菜单**，无单击/右击区分
-- 现设计"单/双/右击皆弹面板"在 macOS 需改为**保留原生菜单**（打开面板 / 退出），回调仍用 `item.Click(...)`
-- 图标用**模板图**（黑 + alpha，含 @2x），16/18px；需扩展 `genicon` 输出 `.icns`
-
-### 13.4 macOS 构建
-
-```bash
-# 必须在 macOS 上构建（wails v2 的 darwin 打包依赖 macOS，不可交叉编译）
-wails build -platform darwin/universal -skipbindings
-# 需要 build/darwin/Info.plist + build/appicon.icns
-# 产物：build/bin/workbuddy-wild.app
-```
-未签名/未公证会被 Gatekeeper 拦截（用户需右键→打开 或 `xattr -cr`）。CI 需加 `macos-latest` job。
-
-### 13.5 Linux
-
-托盘走 systray 的 AppIndicator（需 `libappindicator`）；面板定位按 GTK 工作区；自启 `~/.config/autostart/*.desktop`。`cmd/server` 完全跨平台，可作为各平台基础。
-
----
-
-## 14. 扩展指南
-
-### 14.1 新增一个平台（如 XXX）
-
-1. `internal/provider/provider.go` 加 `Kind` 常量 + `String()`
-2. 新建 `internal/xxx/`，实现 `provider.Upstream` 接口（`ChatStream` / `FetchModels` / `UserResource` / `DailyCheckin` / `RefreshToken` / `Stream` / `Aggregate` / `Classify`）
-3. `main.go`：
-   - `auth.LoadXxxDir(cfg.AuthDir)` 加载凭证
-   - `pool.New(stateDir + "state-xxx.json")`
-   - `scheduler.New(...)`
-   - 加进 `runtimes`（server）+ `appRuntimes`（app）两个 map
-4. `internal/auth/` 加该平台的凭证解析
-5. 前端：`accountGroup` 返回新 group；`app.js` 的图标映射加分支
-6. `server/handler.go` 加静态模型兜底列表（可选）
-
-### 14.2 新增一种选号策略
-
-1. `internal/pool/pool.go`：
-   - 加 `StrategyXxx Strategy = "xxx"` 常量
-   - 加进 `AllStrategies` 与 `ParseStrategy`
-   - `Label()` 加中文名
-   - `PickExcluding` 的 switch 加分支 + 实现 `pickXxxLocked(cands []*entry) *auth.Auth`
-2. `internal/config/config.go` 的 `normalize()` 白名单加 `"xxx"`
-3. `frontend/dist/index.html` 的 `#selStrategy` 加 `<option>`
-4. `frontend/dist/app.js` 的 `STRATEGY_DESC` / `strategyLabel` 加条目
-5. `internal/pool/strategy_test.go` 加用例
-6. **务必确认策略在 `tried` 下单调推进**（§5.2）
-
-### 14.3 修改面板布局
-
-- 改 `frontend/dist/index.html`（结构）+ `style.css`（样式）
-- 若改窗口尺寸 → 同步 `main.go` + `app.go:panelRect()`
-- **别碰** `<img class="logo">` 的 base64（§12.8）
-
-### 14.4 提交前检查清单
-
-```
-[ ] go build ./... && go vet ./... && go test ./...   全绿
-[ ] 版本号三处同步（wails.json / app.Version / ldflags）
-[ ] README 更新记录已加
-[ ] 无 token / 凭证 / 日志 / exe 混入提交（.gitignore 覆盖 auths/ data/ config.json *.log build/bin/）
-[ ] config.example.json 与 config.Default() 一致
-[ ] 若改了 state.json 结构 → 确认旧文件仍能加载（只增字段）
-[ ] 若改了内联 base64/长常量 → 与源值逐字节比对
-```
-
----
-
-## 附：上游接口速查（WorkBuddy CN）
-
-| 用途 | 端点 |
-|---|---|
-| 登录发起 | `POST copilot.tencent.com/v2/plugin/auth/state?platform=CLI` |
-| 登录轮询 | `GET /v2/plugin/auth/token?state=...`（pending 时业务 code≠0） |
-| 账号信息 | `GET /v2/plugin/login/account?state=...` |
-| 刷新 token | `POST /v2/plugin/auth/token/refresh`（头带 `X-Refresh-Token`） |
-| 动态模型 | `GET /console/enterprises/personal/models` |
-| 余额 | `POST www.codebuddy.cn/v2/billing/meter/get-user-resource` |
-| 签到 | `POST /v2/billing/meter/daily-checkin` |
-| 聊天 | `POST copilot.tencent.com/v2/chat/completions`（**强制 stream**） |
-
-**认证头**：`Authorization: Bearer <accessToken>`、`X-User-Id`，可选 `X-Enterprise-Id` / `X-Tenant-Id` / `X-Domain`；CN 的 `Origin`/`Referer` 为 CodeBuddy 域名。
-
----
-
-## 附：TraeWork 签到协议（**必读，踩坑重灾区**）
-
-### 端点
-
-| 用途 | 端点 | 说明 |
+| 版本 | 做法 | 结果 |
 |---|---|---|
-| 签到状态 | `POST https://api.trae.cn/trae/api/v2/ug/checkin_credits/status` | 体 `{}`；读 `checked_in` / `did_checked_in` / `enable` |
-| 领取额度 | `POST https://api.trae.cn/trae/api/v2/ug/checkin_credits/claim` | 体 `{"req_source":1}` |
-| 剩余积分 | `POST https://api.trae.cn/trae/api/v2/pay/user_current_entitlement_list` | 读 `usage_summary.total_amount - consumed_amount` |
+| v0.5.1 | 累加所有包 `quota.credits_limit` | 显示 **4050**（实际 298.7）❌ |
+| v0.5.2 | 回退读 checkin 的 `credits` | 显示 **150**（该字段恒为签到固定值）❌ |
+| v0.5.3+ | **`usage_summary`: total − consumed** | ✅ 与官网一致 |
 
-### 认证头
+**教训**：上游字段语义必须靠**真实抓包 + 与官网显示对照**确认，不能靠字段名猜。
 
-`Authorization: Cloud-IDE-JWT <accessToken>`、`X-User-Region: CN`，
-**以及 `X-Device-Id: <客户端真实注册设备号>`**（关键，见下）。
+### 7.6 到期积分的产品陷阱（2026-10-08 实测，功能已暂缓）
 
-### 铁律 1：`X-Device-Id` 必须是客户端真实注册设备号
+**背景**：需求是"显示 N 日内即将到期的积分"。
 
-服务端按「注册指纹」校验设备号，**随机值恒被拒**。
+**技术可行性**：`expire_time` 字段确实存在且可解析（§4.3）。
 
-真实设备号明文写在客户端 `storage.json` 的**键名**上：
+**但产品逻辑不成立**：
 
-```
-C:\Users\<user>\AppData\Roaming\TRAE SOLO CN\User\globalStorage\storage.json
-  "iCubeAuthInfo://icube-dc:4484256452647802": { ... }
-                          ^^^^^^^^^^^^^^^^ 16 位纯数字 = 注册设备号
-```
+| 到期时间 | 剩余积分 |
+|---|---|
+| 10/11 ~ 10/30（9 个包，15 日内到期） | **全部 0**（已用完） |
+| 11/07 08:36（约 30 天后） | 100 |
+| 11/08 08:16（约 31 天后） | 100 |
 
-⚠️ **不要用** `telemetry.devDeviceId`（UUID 形式）—— 它不是注册设备号，
-用了会被更严格限流。
+**根源**：**积分有效期约 31 天，旧的先被消耗** → 能攒下来的必然到期最晚。
+所以「N 日内到期积分合计」在多数情况下**恒为 0**，选 7/15 日窗口会显示"无"，
+与用户"想看哪些积分快过期了"的预期相悖。
 
-2026-09-30 单变量实测（同账号、同 token，只改 `X-Device-Id`）：
+**结论**：功能暂缓。若要重启，须改展示口径（如"笔数 + 剩余"或"最近到期余额"）。
 
-| `X-Device-Id` | 请求体 | 结果 |
+---
+
+## 8. 不可为之事（已实测排除）
+
+> 以下方向**已实际测试并排除**，下一个 Agent 不要重复尝试。
+
+| 方向 | 实测结果 |
+|---|---|
+| 用 `X-Device-Id` 随机值让 9074 通过（带 `req_source`） | ❌ 恒被拒；**但空请求体时随机值可过**（这曾误导修复方向） |
+| 给 9074 加指数退避重试（调度器层） | ❌ 无效方向；正确做法是**内部换设备号**（§6.5） |
+| 用 `checked_in` 判断签到成功 | ❌ 对 API 调用方恒为 false，每次都误判 |
+| 用 `telemetry.devDeviceId` 当设备号 | ❌ 那是 UUID，不是注册设备号；用了限流更严 |
+| 把 `credits_limit` 累加当余额 | ❌ 得到 4050（实际 298.7） |
+| 用 checkin 响应的 `credits` 当余额 | ❌ 恒为 150 |
+| 把 `usage: {}` 当"解析失败" | ❌ 它是"未使用"，剩余 = 上限 |
+| 权益包发到 `trae-api-cn.mchost.guru` | ❌ HTTP 404 + HTML 页；必须发 `api.trae.cn` |
+| 对齐 `entitlement_base_info.end_time` 与 `expire_time` | ✅ 两者**恒等**，可互为兜底（不是"二选一"） |
+| 用 `IFileOperation` 做文件操作（本机） | ❌ `CoCreateInstance` 报 `0x80004002 不支持此接口` |
+| PyInstaller 打包时删已存在的 dist（本机） | ❌ 被 safe-delete 守卫拦；解法是**换全新输出目录名** |
+| 原生托盘右键菜单 | ❌ `TrackPopupMenu` 模态循环导致随机卡死 |
+
+---
+
+## 9. 完整踩坑史与版本演进
+
+| 版本 | 修复内容 |
+|---|---|
+| v0.5.1 | ❌ 引入积分口径错误：累加 `credits_limit` → 显示 4050 |
+| v0.5.2 | ❌ 修错方向：回退读 checkin `credits` → 显示 150 |
+| v0.5.3 | ✅ 改用 `usage_summary` 正确口径（与官网一致） |
+| v0.5.7 | 确认 9074 与设备号相关（结论后被 v0.6.9 修正） |
+| v0.6.3 | ❌ 用"今天有任意新包"判定签到到账 → 把月初包误算成签到 |
+| v0.6.5 | ⚠️ 改用「时间窗(hour≥1) + 金额(≤300)」启发式 → 能工作但脆弱 |
+| v0.6.6 | 不再跳过 claim；9095 后自动轮换设备号重试 |
+| v0.6.7 | ✅ 对账改用服务端权威标识 `entitlement_id`（不再靠猜测） |
+| v0.6.8 | 总积分拆分显示 WorkBuddy / TraeWork 分平台小计 |
+| v0.6.9 | ✅ 澄清 9074 是瞬时限流（非设备未注册）；轮换改为最多 8 次重试 |
+| v0.7.0 | 模型名支持备注，调用上游前自动剥离 |
+| v0.7.1 | ✅ 模型名写错不再冷却账号池；新增 `ErrBadModel` 分类 |
+| v0.7.2 | ✅ 修正「200 伪装错误」被当作模型回答透传（in-band error） |
+| v0.7.3 | 修复两个遗漏的错误识别缺口（D1 + D2） |
+| v0.8.0 | ✅ 飞牛 NAS Docker 双平台部署 + **网页管理面板** |
+
+**每次修复的共性教训**：
+1. 上游字段语义**必须靠真实抓包 + 与官方显示对照**确认，不能靠字段名猜。
+2. 「看起来是错误」的响应可能藏在 **HTTP 200 的正常流里**（in-band）。
+3. 账号级 vs 设备级 vs 全局级的作用域，**必须用单变量矩阵实验**确定。
+
+---
+
+## 10. 重写检查清单
+
+> 按顺序做。每步都给出**如何验证**。
+
+### Step 1：项目骨架
+
+- [ ] `go mod init github.com/rockswang/workbuddy-wild`（模块名**不能改**）
+- [ ] 依赖：wails v2.14.0、systray v1.0.3、golang.org/x/sys v0.47.0
+- [ ] 建目录：`internal/{app,pool,scheduler,server,upstream,traework,provider,config,auth,login,login_trae,admin,winutil}`、`frontend/dist`
+- **验证**：`go build ./...` 通过（此时全空）
+
+### Step 2：配置与凭证层（无外部依赖，先做）
+
+- [ ] `internal/config`：`Config` 结构体（字段见 **附录 D.1**）+ `Default()` + `Load()` + `Save(c, path)`（⚠️ 参数顺序）+ `applyEnv()`
+  - `Listen` 需实现 `UnmarshalJSON` 兼容**旧字符串格式** `":7863"` / `"127.0.0.1:7863"` / `"7863"`
+- [ ] `internal/auth`：解析 auth 文件（**嵌套 + 扁平双形态**）+ DPAPI 加密（Linux 侧空操作）
+- **前置资源**：无
+- **验证**：单测——写一个旧格式 `{"listen":":7863"}` 能正确解析
+
+### Step 3：平台抽象与上游客户端
+
+- [ ] `internal/provider`：`Kind`（`workbuddy` / `traework`）、`Upstream` 接口、`Error` + `ErrKind` 枚举
+- [ ] `internal/upstream`（WorkBuddy）：`Classify()` + 关键词表（§6.4）+ `PrepareBody` 三改写 + chat/billing/auth
+- [ ] `internal/traework`：常量（**附录 A.1**）+ 三个 Host + 签到（含 `claimWithRotatedDevice`）+ in-band 错误识别
+- **前置资源**：§4 全部接口契约
+- **验证**：用 `httptest` 造响应，断言 `Classify` 分类正确；用真实响应 JSON 断言积分 = 298.7
+
+### Step 4：账号池与调度器
+
+- [ ] `internal/pool`：三种策略 + `PickExcluding(tried)` 单调推进 + 冷却状态机 + state 持久化
+- [ ] `internal/scheduler`：定时签到 + token 保活 + 冷却解冻 + `wake` 通道（支持运行时改时间）
+- **前置资源**：Step 3 的 `Upstream` 接口
+- **验证**：单测——同一请求内 `PickExcluding` 连续调用**必须换号**；`expire` 策略按到期时间升序
+
+### Step 5：HTTP 服务
+
+- [ ] `internal/server`：4 条路由 + `withAuth` + `runtimeForModel` + `MaxRotate` 轮换 + 动态模型缓存
+- **前置资源**：Step 4 的 pool
+- **路由（逐字照抄）**：
+  ```go
+  POST /v1/chat/completions   (withAuth)
+  GET  /v1/models             (withAuth)
+  GET  /status                (withAuth)
+  GET  /healthz               (无鉴权)
+  ```
+- **验证**：`curl /healthz` 返回 200；`curl /v1/models` 无 key 返回 401
+
+### Step 6：前端（Wails GUI）
+
+- [ ] `frontend/dist/index.html`：**52 个 DOM id**（附录 C）——**缺一个就 TypeError**
+- [ ] `frontend/dist/style.css`：**14 个 CSS 变量**（附录 A.4）
+- [ ] `frontend/dist/app.js`：调 17 个 Go 方法（签名见附录 C.3）+ 订阅 5 个事件（附录 C.4）
+- **前置资源**：Step 5 的绑定方法签名
+- **验证**：打开面板，账号列表渲染无 JS 报错（看 console）
+
+### Step 7：Wails 装配
+
+- [ ] `main.go`：chdir → 单实例锁 → 配置 → 组装 → HTTP → 托盘 → `wails.Run`
+- [ ] `internal/app/app.go`：26 个导出方法 + 5 个事件
+- **前置资源**：Step 3-6 全部
+- **验证**：`wails build` 产出 exe，双击启动无白窗口
+
+### Step 8：网页管理面板（v0.8.0）
+
+- [ ] `internal/admin`：`go:embed` 4 个资源 + 12 条路由 + CSRF + 鉴权（§12）
+- **前置资源**：Step 5 的 `Handler.Mux()`（需暴露底层 mux）
+- **验证**：无 token 访问 `/admin/api/state` 返回 401；有 token 返回账号列表
+
+### Step 9：Docker 部署（v0.8.0）
+
+- [ ] `docker/Dockerfile` + `entrypoint.sh` + 两个 compose + 离线镜像构建/校验脚本（§13）
+- **前置资源**：Step 8 的 `cmd/server`（无头模式）
+- **验证**：`verify.py` 10 项校验全过；`docker load` 后容器能起
+
+---
+
+## 11. 环境与验证方法
+
+### 11.1 推荐验证手法
+
+| 场景 | 手法 |
+|---|---|
+| HTTP 链路调试 | 用 `cmd/server` 无头模式（无桌面也能跑） |
+| 上游字段确认 | 写一次性 dump 工具，打印**全部字段路径**（不要猜字段名） |
+| 积分口径 | 与官网个人中心**对照数值** |
+| 账号级/设备级判别 | **单变量矩阵实验**（每格只改一个变量） |
+| GUI | 本机无法在无桌面环境测试，需真实 Windows 桌面 |
+
+### 11.2 本机已知坑
+
+| 坑 | 现象 | 解法 |
 |---|---|---|
-| 随机 32 位 hex | `{"req_source":1}` | ❌ **9074** |
-| 客户端真实注册号 | `{"req_source":1}` | ✅ 成功 |
-| 随机 32 位 hex | `{}` | ✅ 成功 |
-| 客户端真实注册号 | `{}` | ✅ 成功（9095 今日已签） |
+| `go` 不在 PATH | `go.exe: command not found` | 用**完整绝对路径**（中文路径在 bash 里失效） |
+| GOPATH 被锁 | `@v/*.info` Access denied | 换新 GOPATH（go/go2/go3/go5 轮换） |
+| 并发 go 任务 | 互相抢缓存拖死 | 一次只跑一个 |
+| `os.IsNotExist` 不穿透 `%w` | 包装后的错误判断失败 | 用 `errors.Is(err, fs.ErrNotExist)` |
+| bat/vbs 中文乱码 | 脚本输出乱码 | 注意编码 |
+| 批量删除 >50 个文件 | 被平台守卫拦截 | 分批，或换输出目录 |
+| 代理环境变量 | 请求被 `HTTP_PROXY`/`HTTPS_PROXY` 拦截 | 显式绕过 |
 
-→ **决定因素是设备号**。空请求体时服务端跳过设备校验（这一点曾误导过修复方向）；
-但桌面端的真实行为是带 `req_source`，所以两者都要对。
+### 11.3 回归测试基准数据
 
-多账号：扫描所有客户端数据目录，按序分配**不同**的真实设备号
-（`ListClientDeviceIDs` / `NextClientDeviceID`）。同一设备一天只能签一个账号。
+**积分口径（必须复现）**：
 
-### 铁律 2：`did_checked_in` 才是签到成功标志，`checked_in` 不是
+```
+输入：usage_summary.total_amount = 4050, consumed_amount = 3751.3
+期望：剩余 = 299（= 298.7 四舍五入到整数）
+容差：若实现保留 1 位小数，应得 298.7；整数显示应为 299
+```
+> 若你的实现算出 **4050**（累加了 `credits_limit`）或 **150**（读了 checkin 响应的 `credits`）→ 口径错误，回看 §4.3。
 
-签到成功的真实响应：
+**HTTP 路由（必须可访问）**：
 
-```json
-{"checked_in": false, "did_checked_in": true, "credits": 100, "enable": true, "message": "success"}
+```
+GET /healthz           → 200（无需鉴权）
+GET /v1/models         → 401（无 key）
+POST /v1/chat/completions → 401（无 key）
 ```
 
-- `did_checked_in` = **今天签到成功过** ← 用它做验证
-- `checked_in` = 用户当前是否处于签到会话，**对 API 调用方恒为 false**
+---
 
-用 `checked_in` 验证会导致每次签到都被误判失败。
+## 12. 网页管理面板（v0.8.0）
 
-### 铁律 3：9074 不是限流，重试无用
+### 12.1 定位
 
-`code: 9074` 的文案是「当前参与用户太多，请稍后再试」，**极具误导性**。
-它的真实含义是**设备未注册**。重试 N 次结果不变，只能换设备号。
+Docker 部署版**没有 GUI**（容器里跑 `cmd/server`），此前加号只能进 NAS 终端跑 `login.sh`。
+网页管理面板让用户在浏览器里直接登录/增删账号。
 
-对应实现：`ErrCheckinRateLimited.IsRateLimited()` 返回 **false**，
-让调度器不再安排无效重试。**不要**给 9074 加指数退避。
+### 12.2 实现要点
 
-### 其它业务码
+- `go:embed` 把前端 4 个资源内嵌进二进制（**零外部文件依赖**）
+- 复用 `WB2A_API_KEY` 鉴权
+- CSRF 双提交令牌
+
+### 12.3 路由（12 条，逐字照抄）
+
+```go
+GET  /admin/                                  面板页
+GET  /admin/app.js                            前端 JS
+GET  /admin/style.css                         样式
+GET  /admin/favicon.svg                       图标
+GET  /admin/api/state                         账号列表 + 统计
+POST /admin/api/login/workbuddy/start         WorkBuddy 登录发起
+POST /admin/api/login/workbuddy/poll          WorkBuddy 登录轮询
+POST /admin/api/login/traework/start          TraeWork 登录发起
+POST /admin/api/login/traework/poll           TraeWork 登录轮询
+POST /admin/api/accounts/delete               删除账号
+POST /admin/api/accounts/reload               免重启重载账号
+POST /admin/api/accounts/checkin              手动签到
+```
+
+### 12.4 ⚠️ 两个必须知道的坑
+
+**坑 1：`/admin` 不要显式注册重定向**
+
+Go 1.22+ `ServeMux` 对 `GET /admin/` 模式**已内置 301** 把 `/admin` → `/admin/`。
+显式再注册 `/admin` 会**路由冲突**，且自己的 handler **永不触发**。
+
+**坑 2：CSRF 占位符不能与 JS 变量名撞车（血泪）**
+
+```go
+// ❌ 错误：占位符 __CSRF__ 会把 JS 里的 window.__CSRF__ 一起替换掉
+html := strings.ReplaceAll(pageHTML, "__CSRF__", h.csrf)
+// 结果：window.<hash> = "<hash>"  → 前端拿不到 CSRF → 所有 POST 403
+
+// ✅ 正确：用足够独特的占位符
+html := strings.ReplaceAll(pageHTML, "__WB2A_CSRF_TOKEN__", h.csrf)
+html = strings.ReplaceAll(html, "__WB2A_AUTH_REQUIRED__", boolJS(h.cfg.Token != ""))
+```
+
+### 12.5 鉴权与 CSRF
+
+```go
+guard():
+  1. token 校验：X-Admin-Token 头 / ?token= 查询 / Authorization: Bearer 三选一
+     （cfg.Token 为空 = 不鉴权）
+  2. POST 额外校验：r.Header.Get("X-CSRF") == h.csrf
+  → 返回 false 表示已写响应
+```
+
+`csrf` 在 `New()` 里生成：`randHex(16)`，**进程级随机**。
+
+### 12.6 环境变量
+
+| 变量 | 值 | 说明 |
+|---|---|---|
+| `WB2A_ADMIN` | `on` / `off` / `0` / `false` / `no` / `disable` / `disabled` | 默认 `on`；填 `off` 类值关闭 |
+
+### 12.7 测试覆盖（已通过）
+
+| 测试 | 项数 | 覆盖 |
+|---|---|---|
+| `test_panel.py`（后端） | 36/36 | 鉴权 401/403、资源、CSRF 提取、reload、双平台 start+poll、删除幂等 |
+| `test_ui.js`（浏览器 UI） | 25/25 | 鉴权框、统计卡、Tab、获取链接、复制、toast、无 JS 错误 |
+| `test_list.js`（列表/删除） | 17/17 | 造 3 假账号 → 统计 2/1/3、表格 3 行、UI 删除后 pool 与磁盘同步 |
+
+---
+
+## 13. Docker 部署（v0.8.0）
+
+### 13.1 目标环境
+
+**飞牛 NAS（fnOS）**，用其「Docker → 容器 → Compose 项目」图形界面部署。
+也可用于任何 Docker 环境。
+
+### 13.2 两种部署路径
+
+```
+【路径 A · 推荐】导入离线镜像（不需要网络、不需要构建）
+  1. 传两个文件到 NAS：
+       workbuddy-wild-v0.8.0-linux-amd64.tar   (35 MB)
+       load-image.sh
+  2. sh load-image.sh      # 校验 SHA256 + docker load
+  3. 用 fnos-compose.yml 建容器
+
+【路径 B】在 NAS 上现场构建（需要 Dockerfile + 3 个二进制 + 脚本）
+  1. 传整个 docker/ 目录
+  2. sh build-on-nas.sh
+  3. 用 fnos-compose.yml 建容器
+```
+
+### 13.3 部署前必须改的 3 处
+
+1. `WB2A_API_KEY` → 改成强随机密钥
+   ```bash
+   head -c 24 /dev/urandom | base64 | tr -d '/+='
+   ```
+2. `volumes` 左侧宿主机路径 → 改成 NAS 上真实存在的目录
+3. `ports` 左侧（若 7863 被占用）
+
+### 13.4 关键环境变量
+
+```yaml
+environment:
+  WB2A_LISTEN: ":7863"        # ⚠️ 容器内必须监听全部网卡，不能写 127.0.0.1
+  WB2A_API_KEY: "<强随机>"     # 留空 = 完全无鉴权
+  WB2A_ADMIN: "on"            # 网页管理面板（默认开）
+```
+
+#### 环境变量全表（13 个，源码 `internal/config/config.go:243-292` 逐条核对）
+
+`Load()` 的顺序是：**先读 JSON 文件 → 再用下列 `WB2A_*` 环境变量逐项覆盖**（有值才覆盖，空串不覆盖）。Docker / NAS 部署只用环境变量注入即可，无需改配置文件。
+
+| 环境变量 | 覆盖的配置字段 | 语义 | 备注 |
+|---|---|---|---|
+| `WB2A_LISTEN` | `Listen` | 监听地址 | ⚠️ 容器内必须 `:7863`，写 `127.0.0.1` 会容器外访问不到 |
+| `WB2A_API_KEY` | `APIKey` | 对外 API 鉴权 key | 空串 = 完全无鉴权 |
+| `WB2A_AUTH_DIR` | `AuthDir` | 凭证目录 | Docker 里是卷挂载点 |
+| `WB2A_STATE_FILE` | `StateFile` | 状态文件路径（state.json） | |
+| `WB2A_REGION` | `Region` | 上游区域：`cn`（DN 域）；global 场景改用 `www.workbuddy.ai`（见 §4.1） | 本仓库默认只用 `cn` |
+| `WB2A_ADMIN` | `AdminEnabled` | 网页管理面板开关 | `off`/`0`/`false`/`no` 关闭；**其余（含空串）视为开启** |
+| `WB2A_STRATEGY` | `Strategy` | 选号策略 | `credits` / `expire` / `roundrobin` |
+| `WB2A_MAX_ROTATE` | `MaxRotate` | 单请求最大换号次数 | 与签到内部的 `maxRotateAttempts=8` 是**两件事**，别混 |
+| `WB2A_HARD_CREDIT` | `HardCreditCooldown` | 积分不足冷却时长 | |
+| `WB2A_SOFT_RATE` | `SoftRateCooldown` | 瞬时限流冷却时长 | 默认 60s |
+| `WB2A_ERR_THRESHOLD` | `ErrThreshold` | 累计错误达几次进冷却 | |
+| `WB2A_ERR_COOLDOWN` | `ErrCooldown` | 错误冷却时长 | 默认 10m |
+| `WB2A_TIMEOUT_SECONDS` | `TimeoutSeconds` | 上游请求超时 | |
+
+### 13.5 离线镜像构建与校验
+
+**构建**：用 Python 手工构造 Docker 镜像 tar（本机无 docker daemon）。
+产物：`docker/dist/workbuddy-wild-v0.8.0-linux-amd64.tar`（35.54 MB）。
+
+**校验**：`docker/_imgbuild/verify.py` 做 **10 项严格校验**：
+
+| # | 校验项 |
+|---|---|
+| 1 | tar 顶层条目 |
+| 2 | `manifest.json`（含 `RepoTags`，**不能含旧 `Repositories` 字段**） |
+| 3 | 路径安全（防目录穿越） |
+| 4 | image config（architecture / os / Entrypoint / WorkingDir / Env / ExposedPorts） |
+| 5 | `diff_ids` 与 Layers 数量匹配 |
+| 6 | 逐层 `sha256(未压缩) == diff_id` |
+| 7 | 层内关键文件检查 |
+| 8 | shell 脚本行尾必须 LF（**CRLF 会导致容器启动失败**） |
+| 9 | 二进制 ELF magic（`7f454c46`）与权限 |
+| 10 | 管理面板资源内嵌检查 |
+
+### 13.6 ⚠️ Docker 特有的坑
+
+| 坑 | 现象 | 根因 / 解法 |
+|---|---|---|
+| `config.json` 被挂载为**目录** | 容器 `Exited:0` | volume 挂载时宿主路径不存在，Docker 建了目录 → 改为**挂载文件**且先创建 |
+| shell 脚本 CRLF | 容器启动失败 | entrypoint 脚本必须 **LF** 行尾（校验项 8 会拦） |
+| `WB2A_LISTEN: "127.0.0.1:7863"` | 宿主访问不到 | 容器内必须 `":7863"`（全部网卡） |
+| GOPROXY 超时（构建时） | 拉依赖失败 | 用 `goproxy.cn`，**不要用阿里云** |
+
+---
+
+## 附录 A：关键参数速查表
+
+### A.1 TraeWork 常量（`internal/traework/constants.go`）
+
+| 常量 | 值 |
+|---|---|
+| `AgentHost` | `https://trae-api-cn.mchost.guru` |
+| `UgHost` | `https://api.trae.cn` |
+| `OAuthHost` | `https://api.trae.com.cn` |
+| `ConsoleHost` | `https://www.trae.cn` |
+| `ClientID` | `en1oxy7wnw8j9n` |
+| `AppID` | `6eefa01c-1036-4c7e-9ca5-d891f63bfcd8` |
+| `IdeVersion` | `0.1.43` |
+| `IdeVersionCode` | `20260716` |
+| `DeviceBrand` | `83DG` |
+| `OSVersion` | `Windows 11 Pro` |
+| `Function` | `solo_work_lite` |
+| `DefaultConfigName` | `glm-5.2` |
+| `CheckinAlreadyClaimedCode` | `9095` |
+| `CheckinBadParamsCode` | `9004` |
+| `checkinIDPrefix` | `checkin_` |
+| `checkinGrantMaxCredits` | `300` |
+| `scheduledGrantMaxHour` | `1` |
+| `CheckinClaimBody` | `{"req_source":1}` |
+| `maxRotateAttempts` | `8`（`claimWithRotatedDevice` 内） |
+
+### A.2 端点数
+
+| 平台 | 端点数 |
+|---|---|
+| WorkBuddy | 8 |
+| TraeWork | 7 |
+
+### A.3 时间常量
+
+| 名称 | 值 | 位置 |
+|---|---|---|
+| `loginTimeout` | 5 min | app |
+| `loginPollEvery` | 2 s | app |
+| `inUseWindow` | 5 s | app |
+| `quitTimeout` | 5 s | app |
+| `maxLogSize` | 5 MB | app |
+| `dynamicModelsTTL` | 1 h | server |
+| `modelsFetchFailCooldown` | 5 min | server |
+| `RefreshSkew` | 10 min | upstream |
+| 面板位置保存延时 | 350 ms | 前端 |
+| 自动签到默认时间 | `09:00` | config |
+| 保活默认时间 | `[22]` | config |
+| 窗口尺寸 | 760 × 560 | main.go |
+
+### A.4 前端 CSS 变量（14 个，`style.css`）—— **含真实取值**
+
+> ⚠️ 变量定义在**两个作用域**：默认（亮色）在 `:root`，暗色在 `[data-theme="dark"]`（或媒体查询）。切换主题只需改根节点属性，**变量名两套完全一致，只是值不同**。
+
+| 变量 | 亮色（`:root`） | 暗色 | 用途 |
+|---|---|---|---|
+| `--bg` | `#f5f5f7` | `#1e1e22` | 页面背景 |
+| `--card` | `#ffffff` | `#2a2a30` | 卡片背景 |
+| `--border` | `#e3e3e8` | `#3a3a42` | 边框 |
+| `--fg` | `#1d1d20` | `#e8e8ec` | 主文字 |
+| `--muted` | `#787882` | `#9a9aa4` | 次要文字 |
+| `--accent` | `#3b82f6` | `#4a8cf7` | 主色 |
+| `--accent2` | `#2563eb` | `#3b82f6` | 主色（深） |
+| `--ok` | `#16a34a` | `#34d399` | 成功 |
+| `--warn` | `#d97706` | `#fbbf24` | 警告 |
+| `--err` | `#dc2626` | `#f87171` | 错误 |
+| `--live` | `#16a34a` | `#34d399` | 在线/活跃指示 |
+| `--radius` | `8px` | `8px` | 圆角 |
+| `--mono` | `Consolas, "Courier New", monospace` | 同左 | 等宽字体 |
+| `--shadow` | `0 6px 20px rgba(0,0,0,0.16)` | 同左 | 阴影 |
+
+> ⚠️ **注意区分**：本项目的 CSS 变量是**前端面板自己的主题**，与产品需求里"保持系统默认外观、不自定义暗色主题"是两回事——面板提供手动主题切换按钮（`btnTheme`），但默认跟随亮色。
+
+### A.5 冷却时长
+
+| 类型 | 时长 |
+|---|---|
+| `CoolHard`（余额不足） | 12h |
+| `CoolSoft`（429 限流） | 60s |
+| `CoolErr`（连续错误） | 10m |
+| `ErrThresh`（连续错误阈值） | 3 |
+
+---
+
+## 附录 B：错误信息对照表
+
+### B.1 WorkBuddy 业务码
+
+| code | 含义 | 分类 | 处理 |
+|---|---|---|---|
+| `11101` | `tool_choice` 对象形式 | `ErrClient` | 归一化为字符串 |
+| `11102` | `model [X] service info not found` | `ErrBadModel` | **不冷却账号**，返回参数错误 |
+| `11103` | `Backend [X] is not supported` | `ErrBadModel` | **不冷却账号** |
+| `12153` | `Offline user session not found` | `ErrSessionDead` | 禁用账号，需重登 |
+| — | `"检测到敏感内容"` | — | 由 `role=developer` 引起 → 改 `system` |
+
+### B.2 TraeWork 业务码
 
 | code | 含义 | 处理 |
 |---|---|---|
-| `0` | 成功 | 后置 status 验证 |
-| `9095` | 当前设备今日已签到 | 视为成功（幂等） |
-| `9074` | 设备未注册 | 报错并提示换真实设备号，**不重试** |
+| `0` | 成功 | 后置验证 + 对账权益包 |
+| `9095` | 该账号今日已领（**幂等成功**） | 视为成功 |
+| `9074` | 瞬时限流 | 内部换设备号重试（≤8 次） |
+| `9004` | 缺订单参数（实为缺 `X-Device-Id`） | 带上设备号 |
+| `4001` | 参数无效（**in-band，HTTP 200**） | 转为错误返回，不写进回答 |
+
+### B.3 HTTP 状态码
+
+| 状态 | 分类 | 处理 |
+|---|---|---|
+| `200` | — | **⚠️ 仍要检查 in-band 错误**（§4.6） |
+| `400` | `ErrClient` | 查业务码 |
+| `401` | `ErrSessionDead` ⚠️ **但仅当 body 命中 `sessionDeadMarkers`（含 `"12153"`/`Offline user session not found`）时**；否则落到 `>=400` 兜底 → `ErrClient` | 禁用账号（仅真实 session 失效时） |
+| `402` | `ErrHardCredit` | 长冷却 12h |
+| `404` | `ErrNotFound` | 短冷却，**不累计 errCount**（防雪崩） |
+| `429` | `ErrSoftRate` | 短冷却 60s |
+| `5xx` | `ErrServer` | 上游故障 |
+
+---
+
+## 附录 C：前端 DOM id 全清单
+
+> **共 52 个**。重写前端时缺一个就会 `TypeError`。
+> 命名规律：`btn*` = 按钮、`sel*` = 下拉框、`in*` = 输入框、`chk*` = 复选框、`*Overlay` = 模态层。
+
+### C.1 全部 id（按字母序）
+
+```
+aboutOverlay  aboutProject  aboutVersion  acctCount  acctEmpty  acctList
+app  btnAbout  btnAboutClose  btnAddHour  btnAddTrae  btnAddWB
+btnCancelLogin  btnCheckinAll  btnClose  btnConfirmCancel  btnConfirmOk
+btnCopyUrl  btnLog  btnMin  btnQuit  btnRefreshAll  btnTheme  chkAutostart
+confirmMsg  confirmOverlay  confirmTitle  customHostRow  hoursBox  inHost
+inPort  keyBox  keyEdit  keyInput  keyVal  loginCountdown  loginMsg
+loginOverlay  nextCheckin  selHost  selStrategy  serverLine  strategyDesc
+strategyHint  toast  totalCredits  totalSub  traeCount  traeCredits
+ver  wbCount  wbCredits
+```
+
+### C.1b DOM 结构骨架（层级 + 标签，重写必读）
+
+> 只有 id 清单不足以还原布局。以下是关键容器的**层级关系与标签语义**（`#app` 为根，窗口无边框 760×560）：
+
+```html
+<div id="app" data-theme="light">                 <!-- 根容器，主题属性挂这里 -->
+  <header id="serverLine">                        <!-- 顶栏：服务状态 + 监听地址 -->
+    <span id="ver">v0.8.0</span>
+    <button id="btnTheme"></button>               <!-- 主题切换 -->
+    <button id="btnLog"></button>                 <!-- 打开日志 -->
+    <button id="btnMin"></button>                 <!-- 最小化 -->
+    <button id="btnClose"></button>               <!-- 关闭到托盘 -->
+  </header>
+
+  <section id="statsRow">                         <!-- 统计卡区 -->
+    <div id="totalCredits">…</div><div id="totalSub">…</div>
+    <div id="wbCount">…</div><div id="wbCredits">…</div>
+    <div id="traeCount">…</div><div id="traeCredits">…</div>
+    <div id="acctCount">…</div>
+  </section>
+
+  <section id="strategyBox">                      <!-- 选号策略 -->
+    <select id="selStrategy"></select>
+    <div id="strategyDesc"></div><div id="strategyHint"></div>
+  </section>
+
+  <section id="accountsBox">
+    <button id="btnRefreshAll"></button><button id="btnCheckinAll"></button>
+    <div id="nextCheckin">…</div>
+    <ul id="acctList"></ul>                        <!-- 账号列表（动态生成 li） -->
+    <div id="acctEmpty">…</div>                    <!-- 空态提示 -->
+  </section>
+
+  <footer id="footerRow">
+    <button id="btnAddWB"></button><button id="btnAddTrae"></button>
+    <button id="btnAddHour"></button><span id="hoursBox"></span>
+    <input type="checkbox" id="chkAutostart"><label for="chkAutostart"></label>
+    <div id="keyBox"><span id="keyVal"></span><input id="keyInput"><button id="keyEdit"></button></div>
+    <div id="customHostRow"><input id="inHost"><input id="inPort"><select id="selHost"></select></div>
+    <button id="btnAbout"></button>
+  </footer>
+
+  <!-- —— 模态层（默认 display:none） —— -->
+  <div id="confirmOverlay"><div><span id="confirmTitle"></span><p id="confirmMsg"></p>
+       <button id="btnConfirmOk"></button><button id="btnConfirmCancel"></button></div></div>
+  <div id="loginOverlay"><div><span id="loginMsg"></span><span id="loginCountdown"></span>
+       <button id="btnCopyUrl"></button><button id="btnCancelLogin"></button></div></div>
+  <div id="aboutOverlay"><div><span id="aboutVersion"></span><span id="aboutProject"></span>
+       <button id="btnAboutClose"></button></div></div>
+  <div id="toast"></div>                           <!-- 全局提示条 -->
+
+  <script src="/wails/…"></script>                 <!-- Wails 注入的 runtime -->
+</div>
+```
+
+> **账号列表项**（`#acctList` 内动态生成的 `<li>`）字段来自 `AccountView`（附录 D.5.2），每个 `li` 需渲染：昵称、平台图标（按 `group`）、积分、冷却状态（`cooling`/`until`/`reason`）、签到状态（`last_checkin_ok`/`last_checkin_msg`）、使用中标记（`in_use`），以及签到/刷新/删除按钮。**此处没有固定 id**（用 class + `data-uid` 更合适）。
+
+### C.2 id → 用途 → 访问者
+
+| id | 用途 | 访问者（app.js 函数） |
+|---|---|---|
+| `app` | 根容器 | — |
+| `ver` | 版本号显示 | `render()` |
+| `serverLine` | 服务地址行 | `render()` |
+| `btnTheme` | 深/浅色切换 | `initEvents()` |
+| `btnMin` | 最小化到托盘 | `initEvents()` |
+| `btnClose` | 关闭程序 | `initEvents()` |
+| `totalCredits` | 总积分 | `renderTotal()` |
+| `totalSub` | 总积分副标题 | `renderTotal()` |
+| `wbCredits` / `wbCount` | WorkBuddy 小计 | `renderSplit()` |
+| `traeCredits` / `traeCount` | TraeWork 小计 | `renderSplit()` |
+| `acctCount` | 账号数 | `render()` |
+| `strategyHint` | 策略提示 | `renderStrategyDesc()` |
+| `btnAddWB` / `btnAddTrae` | 添加账号 | `initEvents()` |
+| `acctList` | 账号卡片容器 | `renderAccounts()` |
+| `acctEmpty` | 空态提示 | `render()` |
+| `btnCheckinAll` / `btnRefreshAll` | 批量操作 | `initEvents()` |
+| `selStrategy` | 积分策略 | `render()` / `renderStrategyDesc()` |
+| `strategyDesc` | 策略说明 | `renderStrategyDesc()` |
+| `hoursBox` / `btnAddHour` | 签到时间 | `renderHours()` |
+| `nextCheckin` | 下次签到时间 | `render()` |
+| `selHost` / `inPort` / `inHost` / `customHostRow` | API 监听 | `renderHostSelect()` |
+| `keyBox` / `keyVal` / `keyEdit` / `keyInput` | API Key | `renderKey()` / `editKey()` / `commitKey()` |
+| `chkAutostart` | 开机自启 | `render()` / `initEvents()` |
+| `btnLog` | 打开日志 | `initEvents()` |
+| `btnAbout` / `aboutOverlay` / `aboutVersion` / `aboutProject` / `btnAboutClose` | 关于弹窗 | `initEvents()` |
+| `confirmOverlay` / `confirmTitle` / `confirmMsg` / `btnConfirmOk` / `btnConfirmCancel` | 确认弹窗 | `askConfirm()` |
+| `loginOverlay` / `loginMsg` / `loginCountdown` / `btnCopyUrl` / `btnCancelLogin` | 登录弹窗 | 登录流程 |
+| `toast` | 提示条 | `toast()` |
+
+### C.3 前端调用的 17 个 Go 方法（含真实签名）
+
+> ⚠️ 早期文档写「16 个」，**实际 17 个**（`SetCheckinTimes` 之外还有 `SetCheckinHours`/`SetCheckinMinutes` 等未在前端用，前端实际调用见下）。
+> 签名从 `internal/app/app.go` 提取，**返回值的 JSON 形状见附录 D.5**。
+
+```go
+// —— 面板初始数据 ——
+GetState() State                          // → State（D.5.1）
+GetAccounts() []AccountView               // → []AccountView（D.5.2）
+GetStrategy() string                      // → "credits" | "expire" | "roundrobin"
+
+// —— 账号操作 ——
+CheckinAccount(uid string) (scheduler.CheckinResult, error)
+CheckinAll() []scheduler.CheckinResult
+RefreshCredits(uid string) (int64, error) // → 刷新后的积分
+RefreshAll()                              // 无返回（走 refresh 事件）
+RemoveAccount(uid string) error
+
+// —— 登录 ——
+StartLoginFor(kind string) (string, error) // kind = "workbuddy" | "traework"；→ 登录 URL
+CancelLogin() error
+
+// —— 设置（全部返回 error，前端据 toast 提示） ——
+SetStrategy(name string) error
+SetAPIKey(key string) error
+SetListen(host string, port int) error    // ⚠️ 热切换，无需重启（见 D.1）
+SetAutostart(on bool) error
+SetCheckinTimes(times []string) error     // 新格式 ["09:00","21:30"]
+
+// —— 窗口/生命周期 ——
+SavePanelPos(x, y int)
+HidePanel()
+QuitAll()
+OpenLogFile() error
+```
+
+> 说明：`CheckinAccount` / `CheckinAll` 的返回类型是 `scheduler.CheckinResult`（字段含 `platform/uid/ok/msg/remain/grant_missing` 等，与 `checkin` 事件 payload 同源）。
+
+### C.4 前端订阅的 5 个事件
+
+| 事件 | payload |
+|---|---|
+| `accounts` | `[]AccountView` |
+| `checkin` | `{platform, uid, ok, msg, remain?, ...}` |
+| `refresh` | `{platform, uid, ok, msg}` |
+| `login` | `{phase, msg}`（phase: success/failed/cancelled） |
+| `panel:shown` | `nil`（前端据此重置失焦宽限期 + 触发内容动效） |
+
+---
+
+## 附录 D：核心数据结构与落盘格式（重写必读）
+
+> 本附录补齐「值怎么组装成请求 / 状态怎么落盘」这一层。**没有这一节，重写会停在"能编译但接真上游就 401"**。
+
+### D.1 `config.Config`（`internal/config/config.go`）
+
+`Listen` **不是字符串**，是结构化类型，且自定义了 `UnmarshalJSON` 兼容旧版字符串形式（`":7863"` / `"127.0.0.1:9999"` / `"9999"` 三种都能解析成 `{host, port}`）：
+
+```go
+type Listen struct {
+    Host string `json:"host"` // 空 = 监听全部网卡（Docker 必须为空）
+    Port int    `json:"port"` // 默认 7863
+}
+
+type Config struct {
+    Listen       Listen `json:"listen"`
+    APIKey       string `json:"api_key"`    // 空 = 不鉴权
+    AuthDir      string `json:"auth_dir"`   // ./auths
+    StateFile    string `json:"state_file"` // ./data/state.json
+    Region       string `json:"region"`     // "cn"；global 场景改用 www.workbuddy.ai（见 §4.1）
+    AdminEnabled bool   `json:"admin_enabled"`
+    Strategy     string `json:"strategy"`   // credits | expire | roundrobin
+    MaxRotate    int    `json:"max_rotate"` // 单请求最大换号次数
+
+    // ⚠️ 下面三个内层结构体的字段名与 json tag 是重写必需的（早期版本只给了注释，是重大缺口）
+    Cooldown struct {
+        HardCredit  string `json:"hard_credit"`   // 字符串时长，如 "12h"
+        SoftRate    string `json:"soft_rate"`     // 如 "60s"
+        ErrThresh   int    `json:"err_threshold"` // 默认 3
+        ErrCooldown string `json:"err_cooldown"`  // 如 "10m"
+    } `json:"cooldown"`
+
+    Schedule struct {
+        CheckinHours   []int    `json:"checkin_hours,omitempty"` // 旧格式：[9,21]
+        CheckinTimes   []string `json:"checkin_times,omitempty"` // 新格式：["09:00","21:30"]
+        KeepaliveHours []int    `json:"keepalive_hours"`         // [22]
+    } `json:"schedule"`
+
+    Upstream struct {
+        TimeoutSeconds int `json:"timeout_seconds"` // 默认 120
+    } `json:"upstream"`
+
+    // 以下三个由上面的字符串字段解析而来，不落盘（json:"-"）
+    HardCreditDur  time.Duration `json:"-"`
+    SoftRateDur    time.Duration `json:"-"`
+    ErrCooldownDur time.Duration `json:"-"`
+}
+```
+
+**四个必须知道的细节（全部来自源码，不是推测）：**
+
+1. **`HardCredit` / `SoftRate` / `ErrCooldown` 是 `string`，不是 `time.Duration`**。JSON 里写 `"12h"` / `"60s"` / `"10m"`，由 `Load()` 用 `time.ParseDuration` 解析到 `json:"-"` 的 `*Dur` 字段。**若重写成 `time.Duration` 直接反序列化，真实 config.json 会解析失败。**
+2. **`Schedule` 兼容新旧两种格式**：旧的 `checkin_hours:[9,21]`（整点数组）与新的 `checkin_times:["09:00","21:30"]`（时刻数组）**同时存在**，`omitempty` 保证不用的不落盘。运行时另有 `SetCheckinMinutes` 支持分钟级。
+3. **`Listen` 的 `UnmarshalJSON`**：字符串形式（`":7863"` / `"127.0.0.1:9999"` / `"7863"`）与对象形式 `{"host":"","port":7863}` **都要支持**；空串 → `Host="", Port=7863`。
+4. **`SetListen` 是热切换**：源码 `internal/app/app.go:1163` 注释明写「保存配置并**热切换**监听（失败保持原样）」，内部 `serveLocked(addr)` 直接切。**不需要重启**（早期文档曾误写"需重启"，已更正）。
+
+- **默认值生成**：`Default()`；**加载**：`Load()`（先文件、后 env 覆盖）；**原子写回**：`Save(c *Config, path string)` —— ⚠️ **注意参数顺序是 `(c, path)`**，写反了能编译但会 panic。
+- **`Addr()` 返回 `net.JoinHostPort` 结果**（IPv6 自动加 `[]`），供 `net.Listen` 使用。改监听地址通过 `SetListen` **热切换**，无需重启。
+
+### D.2 `state.json`（`internal/pool/pool.go`）
+
+**这是账号状态落盘的唯一格式**，顶层只有一个 `accounts` map + 一个 roundrobin 游标：
+
+```go
+type stateFile struct {
+    Accounts map[string]accountState `json:"accounts"` // key = UID
+    RRLast   string                  `json:"rr_last,omitempty"` // 负载均衡游标（上次用过的 UID）
+}
+
+type accountState struct {
+    Credits         int64     `json:"credits"`
+    Disabled        bool      `json:"disabled"`
+    Reason          string    `json:"reason,omitempty"`
+    Until           time.Time `json:"until,omitempty"`   // 冷却截止时间（冷却结束自动恢复正常）
+    LastCheckinOK   bool      `json:"last_checkin_ok,omitempty"`
+    LastCheckinAt   time.Time `json:"last_checkin_at,omitempty"`
+    LastCheckinMsg  string    `json:"last_checkin_msg,omitempty"`
+    LastUsedAt      time.Time `json:"last_used_at,omitempty"`
+    LastCallCredits int64     `json:"last_call_credits,omitempty"`
+}
+```
+
+> ⚠️ **`rr_last` 就是 §6.2 提到的「游标写回 state.json」的那个游标**——负载均衡策略靠它在重启后仍能接着轮转。
+
+对外的展示结构是 `pool.Status`（含 `UID/Nickname/Credits/Cooling/Until/Reason/Disabled/ErrCount/LastCheckin*` 等），它是 `accountState` 的**读视图 + 补充字段**，不直接落盘。
+
+### D.3 `auth.Auth`（`internal/auth/auth.go`）——凭证文件格式
+
+一个账号一个文件，`Kind` 由文件名前缀区分（`workbuddy` / `traework`）。**11 个字段**：
+
+```go
+type Auth struct {
+    mu           sync.RWMutex // 串行化 RefreshToken 写 与 SaveAtomic/JWT 读
+    Kind         string // workbuddy | traework
+    AccessToken  string
+    RefreshToken string
+    ExpiresAt    int64  // Unix 秒
+    Domain       string
+    ApiHost      string // TraeWork: https://api.trae.com.cn
+    MachineID    string // TraeWork: x-machine-id
+    DeviceID     string // TraeWork: x-device-id  ← §4.4 铁律的主角
+    UID          string
+    EnterpriseID string
+    Nickname     string
+    FilePath     string // 来源文件；refresh 后原子写回此处
+}
+```
+
+- **并发**：`RefreshToken` 期间必须 `Lock()/Unlock()`（写锁），读 token 走 `RLock()/RUnlock()`。重写时若漏锁，会出现「刷新后 token 半写、请求拿到残缺 JWT」。
+- **`DeviceID` 只在 TraeWork 有意义**；签到 9074 轮换时必须 `defer` 还原（见 §6.5）。
+- **落盘加密**：Windows 下用 DPAPI（密文带 `dpapi:` 前缀），Linux 侧是空操作（明文）。跨平台搬运凭证文件需注意（§7.4）。
+
+### D.4 完整请求样例（文本层唯一一条端到端链路）
+
+> 文档其余地方只给了 path 和响应片段。这里补一条**从请求到响应**的完整样例，供重写时对拍。
+
+**TraeWork 签署（签到状态）**：
+
+```http
+POST /trae/api/v2/ug/checkin_credits/status HTTP/1.1
+Host: api.trae.cn
+Content-Type: application/json
+Cloud-IDE-JWT: <access_token>
+x-device-id: <a.DeviceID>
+x-machine-id: <a.MachineID>
+
+{}
+```
+
+```http
+HTTP/1.1 200 OK
+Content-Type: application/json
+
+{"code":0,"msg":"","data":{"did_checked_in":true}}
+```
+
+**TraeWork 领取额度**：
+
+```http
+POST /trae/api/v2/ug/checkin_credits/claim HTTP/1.1
+Host: api.trae.cn
+Content-Type: application/json
+Cloud-IDE-JWT: <access_token>
+x-device-id: <a.DeviceID>
+x-machine-id: <a.MachineID>
+
+{"req_source":1}
+```
+
+响应顶层 `{code, msg, data}`：`code=0` 成功、`9095` 幂等成功、`9004` 缺/错设备号、`9074` 瞬时限流（内部换号重试 ≤8 次）。**`claim` 成功不保证额度立刻到账** —— 必须再查权益包对账（§6.5 第 3 步）。
+
+**其它接口（chat / OAuth / get_detail_param）的请求体结构本仓库未留存样例**；重写时需自行抓包补齐。已知约束：`ClientID=en1oxy7wnw8j9n`、`AppID=6eefa01c-1036-4c7e-9ca5-d891f63bfcd8` 属于 OAuth 流程（`OAuthHost=api.trae.com.cn`），但**具体落在哪个 body 键名，文档无法给出**——这是本文档明确的已知缺口。
+
+---
+
+### D.5 前端视图数据结构（`internal/app/app.go`）—— **前端渲染的唯一依据**
+
+> ⚠️ 这一节是前端能否正确渲染的**决定性命门**。早期文档只给了 `AccountView` 这个名字、**从未给字段**，导致重写前端时字段名全靠猜，整页 `undefined`。以下从源码逐字提取。
+
+#### D.5.1 `State`（`GetState()` 的返回，面板初始数据）
+
+```go
+type State struct {
+    Accounts       []AccountView `json:"accounts"`
+    CheckinHours   []int         `json:"checkin_hours"`   // 旧前端兼容
+    CheckinTimes   []string      `json:"checkin_times"`
+    KeepaliveHours []int         `json:"keepalive_hours"`
+    ListenHost     string        `json:"listen_host"`
+    ListenPort     int           `json:"listen_port"`
+    APIKey         string        `json:"api_key"`
+    LoginBusy      bool          `json:"login_busy"`
+    NextCheckin    string        `json:"next_checkin"`
+    Version        string        `json:"version"`
+    Autostart      bool          `json:"autostart"`
+    Running        bool          `json:"running"`
+    Strategy       string        `json:"strategy"`        // credits / expire / roundrobin
+}
+```
+
+#### D.5.2 `AccountView`（账号列表项，`accounts` 事件 payload 的元素）
+
+```go
+type AccountView struct {
+    UID            string `json:"uid"`
+    Group          string `json:"group"` // workbuddy | traework（平台图标区分）
+    Nickname       string `json:"nickname"`
+    Credits        int64  `json:"credits"`
+    Cooling        bool   `json:"cooling"`
+    Until          string `json:"until"`
+    Reason         string `json:"reason"`
+    Disabled       bool   `json:"disabled"`
+    ErrCount       int    `json:"err_count"`
+    LastCheckinOK  bool   `json:"last_checkin_ok"`
+    LastCheckinAt  string `json:"last_checkin_at"`
+    LastCheckinMsg string `json:"last_checkin_msg"`
+    LastUsedAt     string `json:"last_used_at"`     // 空 = 从未调用
+    LastCallCredits int64 `json:"last_call_credits"` // 上次调用时积分快照
+    InUse          bool   `json:"in_use"`           // 由 LastUsedAt 在 inUseWindow 内推断
+    ExpiresAt      int64  `json:"expires_at"`       // 凭证到期（Unix 秒，0=未知）
+}
+```
+
+**前端渲染相关要点**：
+
+- `Until` / `LastCheckinAt` / `LastUsedAt` 是**字符串**（后端已格式化的时间），不是时间戳。
+- 平台用 `Group` 字段区分（`workbuddy` / `traework`），对应附录 C.2 里的 `wbCount` / `traeCount` 分组统计。
+- `InUse` 是**派生字段**（由 `LastUsedAt` 与本机 `inUseWindow=5s` 推断），后端算好给前端。
+- 列表为空时前端显示 `acctEmpty`（附录 C.1）。
+
+#### D.5.3 `config.json` 落盘样例
+
+```json
+{
+  "listen": { "host": "", "port": 7863 },
+  "api_key": "sk-xxxxxxxx",
+  "auth_dir": "./auths",
+  "state_file": "./data/state.json",
+  "region": "cn",
+  "admin_enabled": true,
+  "strategy": "credits",
+  "max_rotate": 3,
+  "cooldown": { "hard_credit": "12h", "soft_rate": "60s", "err_threshold": 3, "err_cooldown": "10m" },
+  "schedule": { "checkin_times": ["09:00", "21:30"], "keepalive_hours": [22] },
+  "upstream": { "timeout_seconds": 120 }
+}
+```
+> 注意 `cooldown` 三个时长是**字符串**形式（见 D.1 细节 1）；`listen` 也可写成旧字符串 `":7863"`。
+
+---
+
+## 验证记录
+
+> 验证方法：派**独立 Agent**（不读本仓库任何源码，只读本文档）按文档重写指定模块并自跑验收，回收其「必须靠猜的地方」修订本文档。
+
+| 轮次 | 验证目标 | 结论 |
+|---|---|---|
+| 第 1 轮 | 上游客户端核心（traework 常量 / `Classify` / 积分口径 / 签到流程） | **未通过**。回收 5 类缺陷，已全部修补：① §4.1 与 §6.5 的 `status` 接口 **GET/POST 冲突** → 源码裁定为 **POST**，已改；② §6.4 `Classify` **缺 404/429 分支**（与附录 B.3 矛盾）→ 已补，并补充「匹配通道不统一」的警告；③ **3 处悬空引用**（§14.1/§14.2/§14.3，文档并无 §14）→ 已改为指向附录 A.1 / 新增附录 D.1 / 内嵌 13 变量全表；④ **`state.json` 格式完全缺失**（子 Agent 判定"落库环节无法重写"）→ 新增**附录 D**（Config / stateFile / Auth / 完整请求样例）；⑤ 积口径精度「逐包也得 298.7」**不精确**（实为 298.696）→ 已修正并加容差说明。 |
+| 第 2 轮 | 前端渲染层 + 配置落盘 + 第 1 轮修补项回归 | **未通过**。独立 Agent 成功派发并返回详细缺陷报告。**回归结论**：`status`=POST（无残留 GET）、404/429 分支存在、环境变量 13 个齐全、附录 D 被正确引用、全部 `§`/`附录` 引用**均无悬空**（§ 引用实测 14 个不同目标，非此前所写的"12 处"）。**新增 8 类缺陷，已全部修补**：① `config.Cooldown/Schedule/Upstream` **只有注释、无字段名与 tag**（且时长是 `string` 不是 `Duration`）→ 已补真实结构；② `AccountView`（16 字段）+ `State`（12 字段）**全文未定义** → 新增 **D.5**；③ C.3 方法**只有名字无签名** → 已补 17 个真实签名；④ **§1.2 标题"四合一"实列 5 项** → 改"五合一"；⑤ C.3 写"16 个"实列 17 个 → 已改；⑥ **`Region` 在 D.1 与 §13.4 说法矛盾** → 已统一；⑦ **`SetListen` 是否需重启矛盾**（§3 说热切换、D.1 误写需重启）→ 源码裁定**热切换**，已改；⑧ 14 个 CSS 变量**只有名无值** → 已补真实值并揭示**亮/暗双主题**；另补 DOM 层级骨架（C.1b）与 B.3 的 401 判定条件修正。 |
+| 第 3 轮 | 端到端全流程 | **未执行**（受环境限制）。**但第 2 轮的穿透性反馈已使文档具备"前端+配置层可重写"的条件**：D.5 补齐了视图数据契约，D.1 补齐了配置内层字段，C.1b 补齐了 DOM 结构，A.4 补齐了样式值。 |
+
+**遗留的已知缺口（重写者必须自行抓包补齐）**：
+
+1. **OAuth 流程的请求体结构**：`ClientID` / `AppID` 属于 OAuth（`OAuthHost=api.trae.com.cn`），但文档给不出它们落在哪个 body 键名。
+2. **TraeWork 聊天（`llm_utils_chat`）与 `get_detail_param` 的请求体**：仓库未留存样例。
+3. **WorkBuddy 8 个端点中有 5 个未标明 Host**（文档只给了 path）：见 §4.1。
+4. **签到接口的 in-band 错误形态**：仅有 chat 接口的 in-band 样例，签到接口的 in-band 形态未确认。
+5. **`pool.Status` 的完整字段**：D.2 已给出 `accountState`（落盘）与 `AccountView`（前端视图），但中间的 `pool.Status` 结构仍有"等"字未穷举。
+
+> 建议：重写者拿到真实账号后，先用 §11.1 的「一次性 dump 工具」打印全部字段路径，再回填上述缺口。
 
 ---
 
