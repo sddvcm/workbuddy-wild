@@ -51,3 +51,6 @@ docs/Trae2api-cn/
 docs/traework2api/
 !docs/DEVELOPMENT.md
 !docs/USAGE.md
+# 事故审计/诊断报告同样属于正式文档，需随代码一起留档
+!docs/AUDIT-*.md
+!docs/DIAGNOSIS-*.md

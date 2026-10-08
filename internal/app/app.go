@@ -485,8 +485,15 @@ func (a *App) ShowPanel() {
 	// Win11 修复：先解除最小化/隐藏，再判断是否卡死。
 	// 最小化的窗口 IsHungAppWindow 会误报 true，若先判断就会把"收起"当成"卡死"
 	// 从而拒绝恢复——这正是"缩到托盘后无法恢复"的根因。
+	//
+	// ⚠️ else 分支必须留日志：此前该分支完全静默，导致"用户点了托盘但日志无输出"
+	// 时无法判断是「事件未送达」还是「窗口已可见无需恢复」——这是 2026-10-08
+	// 面板卡死事故诊断中的关键盲区。
 	if winutil.RestoreAndShow(hwnd) {
 		log.Printf("面板窗口已从最小化/隐藏状态恢复")
+	} else {
+		log.Printf("面板窗口已处于可见状态（无需恢复），直接置前：minimized=%t visible=%t",
+			winutil.IsMinimized(hwnd), winutil.IsVisible(hwnd))
 	}
 	// WebView2 无响应检测：仅对**可见**窗口判定，5 秒未处理消息才算卡死。
 	// 此时若继续调 wails runtime（WindowShow 等）会永久阻塞，必须拦截。
@@ -518,19 +525,33 @@ func (a *App) ShowPanel() {
 
 // showPanelNow 实际显示面板（定位到工作区右下角，直接到位）并异步刷新数据。
 // 注意：托盘回调里必须以 go a.ShowPanel() 调用，避免阻塞托盘消息循环。
+//
+// ⚠️ 2026-10-08 事故修复：本函数内所有 Wails runtime 调用都经 runtimeCall 加超时，
+// 且 showMu 改为带超时获取。原因：WebView2 无响应时 runtime 调用会永久阻塞，
+// 原实现持 showMu 阻塞 → 锁永不释放 → 后续所有托盘唤起静默失败（详见 runtimeCall 注释）。
 func (a *App) showPanelNow() {
 	if a.ctx == nil {
 		return
 	}
-	showMu.Lock()
+	if !tryLockTimeout(&showMu, 2*time.Second) {
+		log.Printf("WARN: 获取 showMu 超时（上一次面板显示仍卡在 runtime 调用中），放弃本次显示")
+		return
+	}
 	defer showMu.Unlock()
 	fx, fy, pw, ph := a.panelRect()
 	// 直接到位，不做“低 48px 再上滑”偏移：该偏移在 DPI 缩放下可能让
 	// 初始位置超出工作区底部而遮挡任务栏，且不再有跨步动画的中间态。
-	runtime.WindowSetSize(a.ctx, pw, ph)
-	runtime.WindowSetPosition(a.ctx, fx, fy)
-	runtime.WindowShow(a.ctx)
-	runtime.EventsEmit(a.ctx, "panel:shown", nil) // 前端据此重置失焦宽限期 + 触发内容动效
+	if !runtimeCall("WindowSetSize", func() { runtime.WindowSetSize(a.ctx, pw, ph) }) {
+		// 窗口尺寸设置已卡死，后续调用大概率同样卡死，直接放弃本次显示
+		return
+	}
+	runtimeCall("WindowSetPosition", func() { runtime.WindowSetPosition(a.ctx, fx, fy) })
+	if !runtimeCall("WindowShow", func() { runtime.WindowShow(a.ctx) }) {
+		return
+	}
+	runtimeCall("EventsEmit(panel:shown)", func() {
+		runtime.EventsEmit(a.ctx, "panel:shown", nil) // 前端据此重置失焦宽限期 + 触发内容动效
+	})
 	winutil.FocusWindow(winutil.MainWindow())
 	// 结束再补一次激活规避前台锁
 	a.safeGo(func() {
@@ -540,9 +561,16 @@ func (a *App) showPanelNow() {
 }
 
 // HidePanel 隐藏面板（点击收起按钮 / Esc）。单进程下窗口隐藏，托盘点击再显示。
+//
+// ⚠️ 加日志：此前 HidePanel 完全不记录日志，导致"用户点了什么"无法从日志复原，
+// 是 2026-10-08 面板卡死事故诊断的最大盲区。runtime 调用同样加超时。
 func (a *App) HidePanel() {
-	if a.ctx != nil {
-		runtime.WindowHide(a.ctx)
+	if a.ctx == nil {
+		return
+	}
+	log.Printf("面板隐藏请求（用户收起）")
+	if !runtimeCall("WindowHide", func() { runtime.WindowHide(a.ctx) }) {
+		log.Printf("WARN: WindowHide 未在超时内返回，窗口是否真的隐藏未知")
 	}
 }
 
@@ -559,12 +587,18 @@ const quitTimeout = 5 * time.Second
 // 若 quitTimeout 内进程未退出（WebView2 卡死，runtime 调用失效），强制 os.Exit。
 // 正常路径下 runtime.Quit → wails.Run 返回 → main 返回 → 进程自然退出，
 // 本 goroutine 来不及执行 os.Exit，无副作用。
+//
+// ⚠️ 2026-10-08 修复：原实现对 runtime.Quit 直接同步调用——若 WebView2 已卡死，
+// 该调用会永久阻塞，导致 **os.Exit 兜底永远执行不到、程序反而退不出去**。
+// 现改为经 runtimeCall 加超时，确保后续兜底逻辑必定可达。
 func (a *App) ForceQuit() {
 	go func() {
 		if a.ctx == nil {
 			os.Exit(0)
 		}
-		runtime.Quit(a.ctx)
+		if !runtimeCall("Quit", func() { runtime.Quit(a.ctx) }) {
+			log.Printf("runtime.Quit 未在超时内返回（WebView2 可能已卡死）")
+		}
 		time.Sleep(quitTimeout)
 		log.Printf("优雅退出超时（WebView2 可能已卡死），强制退出")
 		os.Exit(1)
@@ -1217,7 +1251,9 @@ func (a *App) SetAutostart(on bool) error {
 func (a *App) NotifyRefresh(platform, uid string, ok bool, msg string) {
 	log.Printf("GUI refresh platform=%s uid=%s ok=%t msg=%s", platform, uid, ok, msg)
 	if !ok && a.ctx != nil {
-		runtime.EventsEmit(a.ctx, "refresh", map[string]any{"platform": platform, "uid": uid, "ok": ok, "msg": msg})
+		runtimeCall("EventsEmit(refresh)", func() {
+			runtime.EventsEmit(a.ctx, "refresh", map[string]any{"platform": platform, "uid": uid, "ok": ok, "msg": msg})
+		})
 	}
 	a.emitAccounts()
 }
@@ -1228,39 +1264,60 @@ func (a *App) NotifyCheckin(platform string, r scheduler.CheckinResult) {
 		platform, r.UID, r.OK, r.Retryable, r.Msg, r.Remain, r.HasRemain)
 	a.emitAccounts()
 	if a.ctx != nil {
-		runtime.EventsEmit(a.ctx, "checkin", map[string]any{
-			"platform":   platform,
-			"uid":        r.UID,
-			"ok":         r.OK,
-			"retryable":  r.Retryable,
-			"msg":        r.Msg,
-			"remain":     r.Remain,
-			"has_remain": r.HasRemain,
+		runtimeCall("EventsEmit(checkin)", func() {
+			runtime.EventsEmit(a.ctx, "checkin", map[string]any{
+				"platform":   platform,
+				"uid":        r.UID,
+				"ok":         r.OK,
+				"retryable":  r.Retryable,
+				"msg":        r.Msg,
+				"remain":     r.Remain,
+				"has_remain": r.HasRemain,
+			})
 		})
 	}
 }
 
 func (a *App) emitAccounts() {
 	if a.ctx != nil {
-		runtime.EventsEmit(a.ctx, "accounts", a.accountViews())
+		runtimeCall("EventsEmit(accounts)", func() {
+			runtime.EventsEmit(a.ctx, "accounts", a.accountViews())
+		})
 		// 账号数变化 → 面板高度自适应（重算尺寸并保持右下角位置）
 		a.resizePanel()
 	}
 }
 
 // resizePanel 按当前账号数重算面板尺寸并重定位（不打断前端交互）。
+//
+// ⚠️ 2026-10-08 事故修复：本函数此前**完全没有防护**（无 showMu、无超时），
+// 而它被 emitAccounts 调用（12 个调用点，每次签到结果都会走）。
+// 一旦 WindowSetSize 在 WebView2 无响应时阻塞，此 goroutine 永久僵死；
+// 更重要的是它**绕过了 showMu**，与 showPanelNow 竞争同一条 runtime 通道。
+// 现改为：与 showPanelNow 共用 showMu（带超时）+ 每个调用加超时。
 func (a *App) resizePanel() {
 	if a.ctx == nil {
 		return
 	}
+	// 与 showPanelNow 串行化：避免两者同时操作窗口导致竞态；
+	// 带超时获取，确保不会因对方僵死而永久排队。
+	if !tryLockTimeout(&showMu, 2*time.Second) {
+		log.Printf("WARN: 获取 showMu 超时（窗口操作正卡在 runtime 调用中），跳过本次尺寸调整")
+		return
+	}
+	defer showMu.Unlock()
 	fx, fy, pw, ph := a.panelRect()
-	runtime.WindowSetSize(a.ctx, pw, ph)
-	runtime.WindowSetPosition(a.ctx, fx, fy)
+	if !runtimeCall("WindowSetSize(resize)", func() { runtime.WindowSetSize(a.ctx, pw, ph) }) {
+		return
+	}
+	runtimeCall("WindowSetPosition(resize)", func() { runtime.WindowSetPosition(a.ctx, fx, fy) })
 }
 
 func (a *App) emitLogin(phase, msg string) {
 	if a.ctx != nil {
-		runtime.EventsEmit(a.ctx, "login", map[string]string{"phase": phase, "msg": msg})
+		runtimeCall("EventsEmit(login)", func() {
+			runtime.EventsEmit(a.ctx, "login", map[string]string{"phase": phase, "msg": msg})
+		})
 	}
 }
 
@@ -1317,6 +1374,59 @@ func (a *App) safeGo(f func()) {
 		}()
 		f()
 	}()
+}
+
+// runtimeCallTimeout 单次 Wails runtime 调用的等待上限。
+//
+// 背景（2026-10-08 实测事故）：Wails v2 的 runtime 调用（WindowSetSize /
+// WindowSetPosition / WindowShow / WindowHide / EventsEmit）在 WebView2
+// 无响应时会**永久阻塞**。若该调用位于持锁路径（showPanelNow 持 showMu），
+// 锁将永不释放，此后所有托盘唤起全部静默失败（日志零输出）。
+//
+// 1.5s 足够覆盖正常情况（实测通常 <10ms），又能在卡死时快速放弃。
+const runtimeCallTimeout = 1500 * time.Millisecond
+
+// runtimeCall 带超时地执行一次 Wails runtime 调用。
+//
+// 返回 true 表示调用在超时前返回。超时后**不等待**该调用结束——它会随
+// WebView2 一起僵死，但不再阻塞关键路径（保证 showMu 等锁必被释放）。
+//
+// 注意：调用方多数已在自己的 goroutine 中（如 ShowPanel 的 go 化），
+// 这里再起一个 goroutine 是为了「超时后能放弃等待」，而非为了并发。
+func runtimeCall(name string, fn func()) bool {
+	done := make(chan struct{})
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("PANIC in runtime %s: %v", name, r)
+			}
+			close(done)
+		}()
+		fn()
+	}()
+	select {
+	case <-done:
+		return true
+	case <-time.After(runtimeCallTimeout):
+		log.Printf("WARN: Wails runtime %s 超时 %v 未返回（WebView2 可能无响应，已放弃等待）",
+			name, runtimeCallTimeout)
+		return false
+	}
+}
+
+// tryLockTimeout 在给定上限内尝试获取锁；成功返回 true。
+// 用于替代裸 sync.Mutex.Lock()，避免在锁被僵死调用持有时永久排队。
+func tryLockTimeout(mu *sync.Mutex, d time.Duration) bool {
+	deadline := time.Now().Add(d)
+	for {
+		if mu.TryLock() {
+			return true
+		}
+		if time.Now().After(deadline) {
+			return false
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 }
 
 // ---------------------------------------------------------------------------

@@ -574,7 +574,8 @@ function bind() {
   };
   btnConfirmCancel.onclick = closeConfirm;
 
-  // 失焦自动隐藏已由后端 focus watchdog 处理（点击窗口外退出面板进程）
+  // 失焦不自动隐藏：本版本由用户显式点击「最小化」或按 Esc 触发隐藏
+  // （原注释提到的「后端 focus watchdog」在后端并不存在，属过时描述，2026-10-08 更正）
   const onShown = () => {
     // 重触发内容上浮动效
     const el = $("app");
