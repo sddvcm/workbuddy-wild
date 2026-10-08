@@ -158,10 +158,9 @@ const CheckinRateLimitCode = 9074
 // v0.5.4 曾把它当"高峰限流"做指数退避重试；v0.5.7 误改为"设备未注册、
 // 重试无用"；v0.6.9 依据实测重新定性为**瞬时/偶发限流**。
 //
-// IsRateLimited() 仍返回 false —— 语义是"**不交由调度器安排延迟重试**"。
-// 原因：本错误只在**轮换设备号的过程中**出现，此时已在请求内同步重试
-// （最多 maxRotateAttempts 次），比交给调度器"稍后再试"更及时有效。
-// 调度器的延迟重试队列只用于跨小时的补签场景，不适合这种秒级的偶发拒绝。
+// 到了调度器层时，说明**请求内的换号重试已全部失败**
+// （claimWithRotatedDevice 最多 maxRotateAttempts 次）。
+// 此时这一波高峰仍未过去，交给调度器的跨分钟延迟重试队列继续等（见 IsCheckinThrottled）。
 type ErrCheckinRateLimited struct {
 	Attempts int
 	Msg      string
@@ -171,14 +170,28 @@ func (e *ErrCheckinRateLimited) Error() string {
 	return fmt.Sprintf("checkin 9074 (transient throttle): %s", e.Msg)
 }
 
-// IsRateLimited 返回 false：9074 不在调度器层安排延迟重试。
+// IsRateLimited 返回 false：9074 **不**走通用的 isRateLimited 判定链。
 //
 // 语义澄清（v0.6.9）：9074 **是**可重试的瞬时限流，但重试动作已在
 // claimWithRotatedDevice 内部同步完成（换号最多 8 次）。此处返回 false
-// 只是为了**不重复安排**调度器那套"稍后自动重试"，并非表示"重试无用"。
+// 只是为了**不让它落进通用限流分支**，并非表示"重试无用"。
+//
+// ⚠️ 调度器要判断 9074 请用 IsCheckinThrottled()，不要用本方法 —— 见其注释。
 func (e *ErrCheckinRateLimited) IsRateLimited() bool { return false }
 
-// IsCheckinRateLimited 报告错误是否为签到 9074（设备未注册）。
+// IsCheckinThrottled 报告这是签到 9074 瞬时限流，调度器应安排跨分钟延迟重试。
+//
+// 为什么需要它（v0.7.5 缺陷修复）：
+// 调度器原用 `else if isRateLimited(err)` 捕获 9074，但 IsRateLimited()
+// 恒返回 false → 该分支**永不成立**，9074 一直掉到兜底文案，
+// 用户看到英文原文 `checkin 9074 (transient throttle): ...`，
+// 且 Retryable 从未被赋值 → 整条延迟重试队列失活。
+func (e *ErrCheckinRateLimited) IsCheckinThrottled() bool { return true }
+
+// AttemptCount 返回请求内已完成的换号重试次数（仅用于日志）。
+func (e *ErrCheckinRateLimited) AttemptCount() int { return e.Attempts }
+
+// IsCheckinRateLimited 报告错误是否为签到 9074。
 func IsCheckinRateLimited(err error) bool {
 	if err == nil {
 		return false
@@ -385,17 +398,25 @@ func (c *Client) CheckinStatusLegacyRemoved() {}
 
 // CheckinClaim 领取签到额度。
 //
-// 修订（2026-09-30，单变量实测确认）：
+// 9074 的定性史（**务必看完再改**，这里翻过三次车）：
 //
-//	v0.5.4–v0.5.5 把 9074 当"高峰限流"，做 4 次指数退避重试（8s→16s→32s）。
-//	**方向错误**：9074 的真正含义是"设备号未被服务端认作注册设备"，
-//	重试再多次也不会成功（实测连续重试恒返 9074）。
+//	v0.5.4–v0.5.5：当"高峰限流"，做 4 次指数退避（8s→16s→32s）。
+//	               ❌ 退避放在**同一个设备号**上，而 9074 与设备号绑定，重试无效。
+//	v0.5.7–v0.6.8：改判为"设备号未被认作注册设备、重试无用"，一次调用直接放弃。
+//	               ❌ 把"这次这个号被拒"当成了"这个账号永远不行"。
+//	v0.6.9 起（现行）：**瞬时限流，换设备号即可通过**。
+//	               2026-10-02 实测：同一操作有时成功有时 9074，
+//	               且换号重试就能过 —— 这是限流特征，不是设备号非法
+//	               （后者应稳定复现、换号也无用）。
 //
-//	现在的做法：**不重试**，一次调用直接判定。
-//	  9074     → 返回 *ErrCheckinRateLimited（文案说明要换真实设备号）
-//	  0 / 9095 → 成功（9095 表示今日已签，由后置 status 验证兜底）
+// 现行做法：
 //
-// 这样单账号签到耗时从最坏 ~60s 降到 ~1s，且不再给出"稍后自动重试"的空头承诺。
+//	9074 → claimWithRotatedDevice 内部**继续换号重试**（最多 maxRotateAttempts 次）；
+//	       若换完仍被拒，才返回 *ErrCheckinRateLimited 交给调度器安排跨分钟延迟重试。
+//	0 / 9095 → 成功（9095 = 今日已签，由后置 status 验证兜底）。
+//
+// 注意 *ErrCheckinRateLimited 的 IsRateLimited() 恒为 false、而
+// IsCheckinThrottled() 为 true —— 调度器判断 9074 必须用后者。
 func (c *Client) CheckinClaim(a *auth.Auth) error {
 	req, err := http.NewRequest(http.MethodPost, c.ugBase()+EpCheckinClaim, bytes.NewReader([]byte(CheckinClaimBody)))
 	if err != nil {

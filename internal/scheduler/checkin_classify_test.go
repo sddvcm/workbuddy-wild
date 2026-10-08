@@ -2,6 +2,7 @@ package scheduler
 
 import (
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"strings"
@@ -80,14 +81,24 @@ func TestCheckinFreshSuccessNotAlreadyChecked(t *testing.T) {
 	}
 }
 
-// 9074（设备未注册）不得再被当作"可重试的限流"。
+// 9074（瞬时限流）必须被识别为「可重试」并给出中文可操作文案。
 //
-// 实测确认重试永不成功，因此：Retryable 必须为 false，
-// 文案必须给出可操作指引（换真实设备号）。
+// ⚠️ 本测试的**历史版本是假阳性**（v0.7.5 修复）：
+// 旧版用裸 `errors.New("checkin 9074 ...")` 模拟 9074 —— 但裸 error
+// 既不实现 rateLimited 也不实现 checkinThrottled，于是两条接口分支
+// 都走不通，测试实际验证的是「兜底 false 路径」，永远通过。
+//
+// 后果：调度器真实代码里 `else if isRateLimited(checkinErr)` 是个
+// **永不成立的死分支**（*ErrCheckinRateLimited.IsRateLimited() 恒 false），
+// 这个测试完全没能拦住它。修复后必须用**真实的错误类型**来测。
 func TestCheckinDeviceRejectedNotRetryable(t *testing.T) {
+	// 必须用真实类型：它会暴露 IsRateLimited()=false / IsCheckinThrottled()=true 的差异
 	f := &stubUpstream{
-		checkinErr: errors.New("checkin 9074 (device not registered): 当前参与用户太多，请稍后再试"),
-		remain:     100,
+		checkinErr: &traework.ErrCheckinRateLimited{
+			Attempts: 8,
+			Msg:      "当前参与用户太多，请稍后再试",
+		},
+		remain: 100,
 	}
 	p := pool.New("")
 	s := New(Config{Name: "traework", Pool: p, Upstream: f})
@@ -101,11 +112,83 @@ func TestCheckinDeviceRejectedNotRetryable(t *testing.T) {
 	if r.AlreadyChecked {
 		t.Fatal("9074 不是\"已签到\"")
 	}
-	if r.Retryable {
-		t.Fatal("9074 是设备未注册，重试无效，不得标记 Retryable")
+	// ★ 核心断言：9074 是瞬时限流，必须标记 Retryable 才会被延迟重试队列消费
+	if !r.Retryable {
+		t.Fatal("9074 是瞬时限流，必须标记 Retryable=true 才会被 runDueRetries 消费")
 	}
+	// ★ 核心断言：文案必须是中文可操作提示，不能把英文原文透传给用户
 	if r.Msg == "" {
 		t.Fatal("必须给出可操作的错误文案")
+	}
+	if strings.Contains(r.Msg, "transient throttle") {
+		t.Fatalf("文案不得透传英文原文（说明掉进了兜底分支，9074 未被识别）: %q", r.Msg)
+	}
+	if !strings.Contains(r.Msg, "重试") {
+		t.Fatalf("文案应告知会稍后自动重试，实际 %q", r.Msg)
+	}
+}
+
+// 回归：9074 必须真的进入「延迟重试队列」，不是只打个标记。
+//
+// 这是对缺陷 1 + 缺陷 2 的**端到端**验证：checkinOne 产出 Retryable=true
+// 的结论 → runDueRetries 消费 → 安排到 retries 表里。
+// 旧代码两处都断了（9074 走不到 Retryable 分支 + Retryable 无人赋值），
+// 所以本测试在修复前必然失败。
+func TestThrottledCheckinEntersRetryQueue(t *testing.T) {
+	f := &stubUpstream{
+		checkinErr: &traework.ErrCheckinRateLimited{Attempts: 8, Msg: "参与用户太多"},
+		remain:     100,
+	}
+	p := pool.New("")
+	s := New(Config{Name: "traework", Pool: p, Upstream: f})
+	p.Add(&auth.Auth{Kind: "traework", UID: "u1", RefreshToken: "rt", AccessToken: "at",
+		ExpiresAt: time.Now().Add(24 * time.Hour).Unix()})
+
+	// 先确认 checkinOne 会给出 Retryable=true
+	r := s.checkinOne("u1")
+	if !r.Retryable {
+		t.Fatalf("前置条件失败：9074 未标记 Retryable，延迟重试队列必然失活（%+v）", r)
+	}
+
+	// 再走一遍调度器的消费路径（runDueRetries 的判定逻辑）
+	now := time.Now()
+	at, ok := s.markRetryable("u1", now)
+	if !ok {
+		t.Fatal("应能安排重试")
+	}
+	if !at.After(now) {
+		t.Fatalf("重试时刻 %v 应晚于 %v", at, now)
+	}
+	if got := s.dueRetries(at); len(got) != 1 || got[0] != "u1" {
+		t.Fatalf("到期后应从重试队列取出 u1，实际 %v", got)
+	}
+}
+
+// 真实类型与裸错误的行为差异必须被明确锁定 —— 防止后人再退回假阳性写法。
+func TestCheckinThrottleErrorTypeContract(t *testing.T) {
+	err := &traework.ErrCheckinRateLimited{Attempts: 3, Msg: "throttle"}
+
+	// IsRateLimited 恒 false（有意设计：不落进通用限流分支）
+	if isRateLimited(err) {
+		t.Fatal("ErrCheckinRateLimited.IsRateLimited() 必须为 false（否则会与通用限流语义混淆）")
+	}
+	// isCheckinThrottled 必须为 true（调度器靠它识别 9074）
+	if !isCheckinThrottled(err) {
+		t.Fatal("isCheckinThrottled 必须能识别 *ErrCheckinRateLimited —— 这是 9074 分支可达的唯一保证")
+	}
+	// 轮换次数可取出供日志用
+	if n := checkinAttempts(err); n != 3 {
+		t.Fatalf("checkinAttempts=%d want 3", n)
+	}
+	// 包装后仍应可识别（errors.As 穿透）
+	wrapped := fmt.Errorf("checkin failed: %w", err)
+	if !isCheckinThrottled(wrapped) {
+		t.Fatal("包装后的 9074 错误仍必须可识别")
+	}
+
+	// 反向：普通错误不得被误判为限流
+	if isCheckinThrottled(errors.New("connection reset by peer")) {
+		t.Fatal("普通网络错误不得被误判为签到限流")
 	}
 }
 

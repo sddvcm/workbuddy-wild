@@ -498,12 +498,26 @@ func (s *Scheduler) checkinOne(uid string) CheckinResult {
 				r.Msg = "今日已签到，但未查到新增积分（今日额度未增加）"
 				log.Printf("checkin grant-missing platform=%s uid=%s（标记已签但今日签到包不存在）", name, uid)
 			}
-		} else if isRateLimited(checkinErr) {
-			// 上游 9074：设备号未被认作已注册设备。**不是限流**，
-			// 重试永远不会成功（v0.5.7 已实测确认），因此不安排重试，
-			// 而是给出可操作的提示。
-			r.Msg = "签到被拒：设备号未注册，请重新添加该账号"
-			log.Printf("checkin device-rejected platform=%s uid=%s（需换真实设备号，重试无效）", name, uid)
+		} else if isCheckinThrottled(checkinErr) {
+			// 上游 9074：**瞬时限流**（v0.6.9 依据实测定性；v0.5.7 曾误判为
+			// "设备未注册、重试无用"，该结论已作废）。
+			//
+			// 请求内已完成同步换号重试（claimWithRotatedDevice，最多 8 次），
+			// 仍失败才走到这里 —— 说明这一波高峰还没过去。
+			//
+			// 因此：交给调度器的**跨分钟延迟重试队列**（runDueRetries），
+			// 而不是让用户干等到下一个定时点。
+			//
+			// ⚠️ 这里必须用 isCheckinThrottled 而非 isRateLimited：
+			// *ErrCheckinRateLimited 的 IsRateLimited() 恒返回 false
+			//（语义是"不交给 isRateLimited 那套判定"），所以旧代码
+			// `else if isRateLimited(...)` 是**永不成立的死分支**，
+			// 9074 会一直掉到下面的兜底文案，用户看到的是英文原文
+			// `checkin 9074 (transient throttle): ...`。
+			r.Retryable = true
+			r.Msg = "签到被拒：当前签到人数过多，将在稍后自动重试"
+			log.Printf("checkin throttled platform=%s uid=%s attempts=%d（已安排延迟重试）",
+				name, uid, checkinAttempts(checkinErr))
 		}
 	} else {
 		r.OK = true
@@ -530,16 +544,68 @@ func (s *Scheduler) checkinOne(uid string) CheckinResult {
 	return r
 }
 
+// checkinThrottled 由上游客户端实现的"签到被瞬时限流"标记。
+//
+// 与 rateLimited 的区别（两者都表示"限流"，但消费方不同）：
+//   - rateLimited   ：通用请求限流，供 isRateLimited 判定
+//   - checkinThrottled：**签到专属**的 9074，供调度器安排延迟重试
+//
+// 为什么要分开：*traework.ErrCheckinRateLimited 的 IsRateLimited() 恒返回
+// false（这是有意设计 —— 它的重试已在请求内同步做完，不该再走 isRateLimited
+// 那套通用判定）。所以判断 9074 必须用**独立接口**，否则永远判不出来。
+type checkinThrottled interface {
+	IsCheckinThrottled() bool
+}
+
+// isCheckinThrottled 判断错误是否为签到 9074（瞬时限流，应安排延迟重试）。
+//
+// ⚠️ 不要用 isRateLimited 代替：见 checkinThrottled 的说明，那样会恒为 false。
+func isCheckinThrottled(err error) bool {
+	if err == nil {
+		return false
+	}
+	var ct checkinThrottled
+	if errors.As(err, &ct) {
+		return ct.IsCheckinThrottled()
+	}
+	// 兜底：上游若只暴露裸错误而不实现接口，用错误文本识别。
+	// 仅在包含明确的 9074 标记时才认定，避免误伤其它含 "checkin" 的错误。
+	s := strings.ToLower(err.Error())
+	return strings.Contains(s, "9074") || strings.Contains(s, "transient throttle")
+}
+
+// checkinAttempts 从签到限流错误里取出已尝试的轮换次数（供日志用）。
+// 取不到时返回 0。
+func checkinAttempts(err error) int {
+	var att interface{ AttemptCount() int }
+	if errors.As(err, &att) {
+		return att.AttemptCount()
+	}
+	return 0
+}
+
 // rateLimited 由上游客户端实现的"可重试瞬时错误"标记。
 // 用接口探测而非直接 import 具体平台包，避免 scheduler 与各上游耦合。
 type rateLimited interface {
 	IsRateLimited() bool
 }
 
-// isRateLimited 判断错误是否为上游高峰限流（瞬时、可重试，非账号异常）。
+// isRateLimited 判断错误是否为上游**通用**高峰限流（瞬时、可重试，非账号异常）。
 // 同时兼容两类表达：
 //   - 上游客户端定义的错误类型实现了 IsRateLimited() bool
 //   - provider.Error 被分类为 ErrSoftRate（429 类软限流）
+//
+// ⚠️ 状态说明（v0.7.5）：本函数目前**没有生产调用点**。
+//
+// 它此前唯一的调用点是签到 9074 分支，而那是个永不成立的死分支
+// （*ErrCheckinRateLimited.IsRateLimited() 恒为 false），已改用
+// isCheckinThrottled。保留本函数是因为：
+//
+//  1. rateLimited 接口是各上游表达"通用限流"的公共约定，值得留着；
+//  2. provider.ErrSoftRate 的映射仍需有地方承接（HTTP 侧在用它）。
+//
+// 若将来要给"通用请求限流"加调度器级重试，直接复用本函数即可。
+// 但**签到 9074 不要用它** —— 那是 checkinThrottled 的职责。
 func isRateLimited(err error) bool {
 	if err == nil {
 		return false
